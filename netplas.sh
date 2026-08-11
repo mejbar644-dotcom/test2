@@ -11,17 +11,15 @@ NC='\033[0m' # No Color
 clear
 echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║            GitHub: Netplas                 ║${NC}"
-echo -e "${CYAN}║     AmneziaWG Anti-Filter Tunnel v4.2      ║${NC}"
+echo -e "${CYAN}║     AmneziaWG Anti-Filter Tunnel v4.3      ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
 echo ""
 
-# بررسی دسترسی روت
 if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}[!] Please run this script as root (sudo)!${NC}"
   exit 1
 fi
 
-# بررسی و نصب ابزارها
 if ! command -v awg &> /dev/null || ! command -v awg-keygen &> /dev/null; then
     echo -e "${YELLOW}[*] Installing AmneziaWG and dependencies...${NC}"
     apt-get update
@@ -43,7 +41,6 @@ echo -e "  ${RED}3${NC} - Uninstall & Remove Tunnel Completely"
 echo ""
 read -p "Enter your choice (1, 2 or 3): " LOCATION
 
-# گزینه ۳: حذف کامل تونل
 if [[ "$LOCATION" == "3" ]]; then
     echo -e "${RED}[*] Uninstalling and cleaning up AmneziaWG tunnel...${NC}"
     systemctl stop awg-quick@awg0 2>/dev/null
@@ -70,10 +67,12 @@ AWG_PORT=${AWG_PORT:-443}
 
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
 
-# پاکسازی اینترفیس‌های قبلی و متوقف کردن سرویس قدیمی
+# پیدا کردن پورت فعال SSH برای جلوگیری از قطع شدن اتصال کاربر
+CURRENT_SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F':' '{print $NF}' | head -n1)
+CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-22}
+
 systemctl stop awg-quick@awg0 2>/dev/null
 ip link del awg0 2>/dev/null
-
 mkdir -p /etc/amnezia/amneziawg
 
 if [[ "$LOCATION" == "1" ]]; then
@@ -88,7 +87,6 @@ if [[ "$LOCATION" == "1" ]]; then
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
     echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ipforward.conf
 
-    # ساخت فایل کانفیگ پایدار (که با ریستارت پاک نمی‌شود)
     cat <<EOF > /etc/amnezia/amneziawg/awg0.conf
 [Interface]
 Address = 10.0.0.2/30
@@ -112,18 +110,17 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
-    # اعمال قوانین NAT و فوروارد
+    # اعمال قوانین NAT با محافظت از پورت‌های مهم (SSH جاری، 80، 443 و ابزارها)
     iptables -t nat -F
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports ${CURRENT_SSH_PORT},80,443,10052 -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -m multiport ! --dports ${AWG_PORT} -j DNAT --to-destination 10.0.0.1
     iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
-    # ثبت به عنوان سرویس سیستمی دائمی
     systemctl enable --now awg-quick@awg0
 
     echo -e "${GREEN}[+] Iran server configured and running permanently!${NC}"
-    echo -e "Your Iran Server Public Key: ${CYAN}$PubKey${NC}"
+    echo -e "Your Iran Server Public Key is: ${CYAN}$PubKey${NC}"
 
 elif [[ "$LOCATION" == "2" ]]; then
     echo -e "${YELLOW}[*] Configuring FOREIGN server permanently...${NC}"
@@ -138,7 +135,6 @@ elif [[ "$LOCATION" == "2" ]]; then
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
     echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ipforward.conf
 
-    # ساخت فایل کانفیگ پایدار برای سرور خارج
     cat <<EOF > /etc/amnezia/amneziawg/awg0.conf
 [Interface]
 Address = 10.0.0.1/30
@@ -165,7 +161,6 @@ EOF
     iptables -A FORWARD -o awg0 -j ACCEPT
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
-    # ثبت به عنوان سرویس سیستمی دائمی
     systemctl enable --now awg-quick@awg0
 
     echo -e "${GREEN}[+] Foreign server configured and running permanently!${NC}"
