@@ -1,17 +1,16 @@
 #!/bin/bash
 
-# Color Palette
 CYAN='\033[1;36m'
 YELLOW='\033[1;33m'
 GREEN='\033[1;32m'
 RED='\033[1;31m'
 PURPLE='\033[1;35m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 clear
 echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║            GitHub: Netplas                 ║${NC}"
-echo -e "${CYAN}║     AmneziaWG Anti-Filter Tunnel v4.3      ║${NC}"
+echo -e "${CYAN}║     AmneziaWG Anti-Filter Tunnel v4.4      ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -27,11 +26,6 @@ if ! command -v awg &> /dev/null || ! command -v awg-keygen &> /dev/null; then
     add-apt-repository -y ppa:amnezia/ppa &>/dev/null
     apt-get update
     apt-get install -y amneziawg amneziawg-tools
-fi
-
-if ! command -v awg &> /dev/null; then
-    echo -e "${RED}[!] Error: 'awg' command could not be installed properly.${NC}"
-    exit 1
 fi
 
 echo -e "${PURPLE}Select an option:${NC}"
@@ -66,8 +60,6 @@ read -p "Enter AmneziaWG Port (Default 443): " AWG_PORT
 AWG_PORT=${AWG_PORT:-443}
 
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
-
-# پیدا کردن پورت فعال SSH برای جلوگیری از قطع شدن اتصال کاربر
 CURRENT_SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F':' '{print $NF}' | head -n1)
 CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-22}
 
@@ -81,7 +73,13 @@ if [[ "$LOCATION" == "1" ]]; then
     PrivKey=$(awg genkey)
     PubKey=$(echo "$PrivKey" | awg pubkey)
 
-    echo -e "${YELLOW}[?] Please run the Foreign server configuration first and get its Public Key.${NC}"
+    # نمایش کلید عمومی در همان ابتدا تا از دست نرود
+    echo ""
+    echo -e "${GREEN}==================================================${NC}"
+    echo -e "Your Iran Server Public Key is: ${CYAN}$PubKey${NC}"
+    echo -e "${GREEN}==================================================${NC}"
+    echo ""
+
     read -p "Enter FOREIGN server Public Key: " FOREIGN_PUBKEY
 
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
@@ -110,9 +108,8 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
-    # اعمال قوانین NAT با محافظت از پورت‌های مهم (SSH جاری، 80، 443 و ابزارها)
     iptables -t nat -F
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports ${CURRENT_SSH_PORT},80,443,10052 -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports ${CURRENT_SSH_PORT},22,80,443,10052 -j DNAT --to-destination 10.0.0.1
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -m multiport ! --dports ${AWG_PORT} -j DNAT --to-destination 10.0.0.1
     iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
@@ -120,7 +117,6 @@ EOF
     systemctl enable --now awg-quick@awg0
 
     echo -e "${GREEN}[+] Iran server configured and running permanently!${NC}"
-    echo -e "Your Iran Server Public Key is: ${CYAN}$PubKey${NC}"
 
 elif [[ "$LOCATION" == "2" ]]; then
     echo -e "${YELLOW}[*] Configuring FOREIGN server permanently...${NC}"
