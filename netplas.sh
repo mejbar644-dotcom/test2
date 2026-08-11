@@ -11,7 +11,7 @@ NC='\033[0m' # No Color
 clear
 echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║            GitHub: Netplas                 ║${NC}"
-echo -e "${CYAN}║     AmneziaWG Anti-Filter Tunnel v4        ║${NC}"
+echo -e "${CYAN}║     AmneziaWG Anti-Filter Tunnel v4.2      ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -21,14 +21,19 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# بررسی نصب بودن ابزارها
-if ! command -v awg &> /dev/null; then
+# بررسی و نصب ابزارها
+if ! command -v awg &> /dev/null || ! command -v awg-keygen &> /dev/null; then
     echo -e "${YELLOW}[*] Installing AmneziaWG and dependencies...${NC}"
     apt-get update
     apt-get install -y curl wget iptables software-properties-common
     add-apt-repository -y ppa:amnezia/ppa &>/dev/null
     apt-get update
     apt-get install -y amneziawg amneziawg-tools
+fi
+
+if ! command -v awg &> /dev/null; then
+    echo -e "${RED}[!] Error: 'awg' command could not be installed properly.${NC}"
+    exit 1
 fi
 
 echo -e "${PURPLE}Select an option:${NC}"
@@ -65,14 +70,14 @@ AWG_PORT=${AWG_PORT:-443}
 
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
 
-# پاکسازی اینترفیس‌های قبلی
+# پاکسازی اینترفیس‌های قبلی و متوقف کردن سرویس قدیمی
 systemctl stop awg-quick@awg0 2>/dev/null
 ip link del awg0 2>/dev/null
 
 mkdir -p /etc/amnezia/amneziawg
 
 if [[ "$LOCATION" == "1" ]]; then
-    echo -e "${YELLOW}[*] Configuring IRAN server...${NC}"
+    echo -e "${YELLOW}[*] Configuring IRAN server permanently...${NC}"
 
     PrivKey=$(awg genkey)
     PubKey=$(echo "$PrivKey" | awg pubkey)
@@ -83,7 +88,7 @@ if [[ "$LOCATION" == "1" ]]; then
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
     echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ipforward.conf
 
-    # ساخت فایل کانفیگ پایدار برای سرور ایران
+    # ساخت فایل کانفیگ پایدار (که با ریستارت پاک نمی‌شود)
     cat <<EOF > /etc/amnezia/amneziawg/awg0.conf
 [Interface]
 Address = 10.0.0.2/30
@@ -107,21 +112,21 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
-    # اعمال قوانین NAT و فوروارد (با حفظ پورت‌های مدیریتی ۲۲، ۸۰ و غیره)
+    # اعمال قوانین NAT و فوروارد
     iptables -t nat -F
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -j DNAT --to-destination 10.0.0.1
     iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
-    # فعال‌سازی سرویس دائمی
+    # ثبت به عنوان سرویس سیستمی دائمی
     systemctl enable --now awg-quick@awg0
 
     echo -e "${GREEN}[+] Iran server configured and running permanently!${NC}"
     echo -e "Your Iran Server Public Key: ${CYAN}$PubKey${NC}"
 
 elif [[ "$LOCATION" == "2" ]]; then
-    echo -e "${YELLOW}[*] Configuring FOREIGN server...${NC}"
+    echo -e "${YELLOW}[*] Configuring FOREIGN server permanently...${NC}"
 
     PrivKey=$(awg genkey)
     PubKey=$(echo "$PrivKey" | awg pubkey)
@@ -160,7 +165,7 @@ EOF
     iptables -A FORWARD -o awg0 -j ACCEPT
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
-    # فعال‌سازی سرویس دائمی
+    # ثبت به عنوان سرویس سیستمی دائمی
     systemctl enable --now awg-quick@awg0
 
     echo -e "${GREEN}[+] Foreign server configured and running permanently!${NC}"
