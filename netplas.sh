@@ -9,7 +9,7 @@ RESET=$(tput sgr0)
 echo -e "${CYAN}"
 echo "===================================="
 echo "          GitHub: Netplas"
-echo "  AmneziaWG Anti-Filter Tunnel v4.1"
+echo "  AmneziaWG Anti-Filter Tunnel v5"
 echo "===================================="
 echo -e "${RESET}"
 
@@ -35,10 +35,12 @@ if [[ "$LOCATION" == "3" ]]; then
     ip link del awg0 2>/dev/null
     rm -rf /etc/amnezia
     
-    # پاکسازی ایمن IPTables
-    iptables -F FORWARD 2>/dev/null
-    iptables -t nat -F PREROUTING 2>/dev/null
-    iptables -t nat -F POSTROUTING 2>/dev/null
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
     
     echo -e "${GREEN}[+] Tunnel removed successfully!${RESET}"
     exit 0
@@ -51,7 +53,7 @@ AWG_PORT=${AWG_PORT:-51820}
 
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
 
-# حذف اینترفیس قبلی در صورت وجود
+# حذف اینترفیس قبلی
 ip link del awg0 2>/dev/null
 
 if [[ "$LOCATION" == "1" ]]; then
@@ -63,7 +65,6 @@ if [[ "$LOCATION" == "1" ]]; then
     echo -e "${YELLOW}[?] Please run the Foreign server script first.${RESET}"
     read -p "Enter FOREIGN server Public Key: " FOREIGN_PUBKEY
     
-    # دریافت مقادیر تصادفی H1 تا H4
     read -p "Enter H1 value from Foreign server: " H1
     read -p "Enter H2 value from Foreign server: " H2
     read -p "Enter H3 value from Foreign server: " H3
@@ -84,26 +85,28 @@ if [[ "$LOCATION" == "1" ]]; then
     awg set awg0 peer "$FOREIGN_PUBKEY" endpoint "$IP_FOREIGN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev awg0 up
 
-    # تنظیمات صحیح IPTables در سرور ایران
-    iptables -F FORWARD
-    iptables -t nat -F PREROUTING
-    iptables -t nat -F POSTROUTING
+    # پاکسازی کامل قوانین قبلی
+    iptables -F
+    iptables -t nat -F
+    iptables -t mangle -F
 
-    # اجازه عبور به ترافیک تانل و لایه داخلی
-    iptables -A INPUT -i awg0 -j ACCEPT
-    iptables -A FORWARD -i awg0 -j ACCEPT
-    iptables -A FORWARD -o awg0 -j ACCEPT
-    iptables -A FORWARD -i $MAIN_INTERFACE -o awg0 -j ACCEPT
-    iptables -A FORWARD -i awg0 -o $MAIN_INTERFACE -j ACCEPT
+    # اجازه عبور ترافیک‌های ورودی و خروجی
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
 
-    # تنظیم MSS جهت جلوگیری از افت سرعت و عدم لود صفحات
+    # تنظیم MSS برای جلوگیری از شکستن بسته‌ها
     iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-    # استثنا کردن پورت تانل و فوروارد صحیح UDP/TCP به سرور خارج
+    # استثنا کردن پورت تانل و پورت‌های مدیریت سرور ایران
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp --dport $AWG_PORT -j ACCEPT
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp ! --dport $AWG_PORT -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp --dport $AWG_PORT -j ACCEPT
     
+    # فوروارد کردن کل ترافیک به سرور خارج (به جز پورت‌های SSH و وب‌سرور)
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp ! --dports $AWG_PORT -j DNAT --to-destination 10.0.0.1
+    
+    # ماسکرید ترافیک
     iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
@@ -116,7 +119,6 @@ elif [[ "$LOCATION" == "2" ]]; then
     PrivKey=$(awg genkey)
     PubKey=$(echo "$PrivKey" | awg pubkey)
 
-    # تولید اعداد تصادفی ۳۲ بیتی برای هدرها
     H1=$(shuf -i 100000000-2147483647 -n 1)
     H2=$(shuf -i 100000000-2147483647 -n 1)
     H3=$(shuf -i 100000000-2147483647 -n 1)
@@ -148,14 +150,15 @@ elif [[ "$LOCATION" == "2" ]]; then
     awg set awg0 peer "$IRAN_PUBKEY" endpoint "$IP_IRAN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev awg0 up
 
-    # تنظیمات صحیح IPTables در سرور خارج
-    iptables -F FORWARD
-    iptables -t nat -F POSTROUTING
+    # پاکسازی و اعمال قوانین سرور خارج
+    iptables -F
+    iptables -t nat -F
+    iptables -t mangle -F
 
-    iptables -A INPUT -i awg0 -j ACCEPT
-    iptables -A FORWARD -i awg0 -j ACCEPT
-    iptables -A FORWARD -o awg0 -j ACCEPT
-    
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+
     iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
