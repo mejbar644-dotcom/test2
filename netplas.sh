@@ -9,7 +9,7 @@ RESET=$(tput sgr0)
 echo -e "${CYAN}"
 echo "===================================="
 echo "          GitHub: Netplas"
-echo "  AmneziaWG Anti-Filter Tunnel v4"
+echo "  AmneziaWG Anti-Filter Tunnel v4.1"
 echo "===================================="
 echo -e "${RESET}"
 
@@ -35,10 +35,10 @@ if [[ "$LOCATION" == "3" ]]; then
     ip link del awg0 2>/dev/null
     rm -rf /etc/amnezia
     
-    # پاکسازی ایمن قوانین مرتبط با awg0
-    iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null
-    iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null
-    iptables -t nat -D POSTROUTING -o awg0 -j MASQUERADE 2>/dev/null
+    # پاکسازی ایمن IPTables
+    iptables -F FORWARD 2>/dev/null
+    iptables -t nat -F PREROUTING 2>/dev/null
+    iptables -t nat -F POSTROUTING 2>/dev/null
     
     echo -e "${GREEN}[+] Tunnel removed successfully!${RESET}"
     exit 0
@@ -63,7 +63,7 @@ if [[ "$LOCATION" == "1" ]]; then
     echo -e "${YELLOW}[?] Please run the Foreign server script first.${RESET}"
     read -p "Enter FOREIGN server Public Key: " FOREIGN_PUBKEY
     
-    # دریافت مقادیر تصادفی H1 تا H4 تولید شده در سرور خارج
+    # دریافت مقادیر تصادفی H1 تا H4
     read -p "Enter H1 value from Foreign server: " H1
     read -p "Enter H2 value from Foreign server: " H2
     read -p "Enter H3 value from Foreign server: " H3
@@ -84,11 +84,26 @@ if [[ "$LOCATION" == "1" ]]; then
     awg set awg0 peer "$FOREIGN_PUBKEY" endpoint "$IP_FOREIGN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev awg0 up
 
-    # پاکسازی و اعمال IPTables (استثنا کردن پورت اصلی تانل جهت جلوگیری از Loop)
+    # تنظیمات صحیح IPTables در سرور ایران
+    iptables -F FORWARD
     iptables -t nat -F PREROUTING
+    iptables -t nat -F POSTROUTING
+
+    # اجازه عبور به ترافیک تانل و لایه داخلی
+    iptables -A INPUT -i awg0 -j ACCEPT
+    iptables -A FORWARD -i awg0 -j ACCEPT
+    iptables -A FORWARD -o awg0 -j ACCEPT
+    iptables -A FORWARD -i $MAIN_INTERFACE -o awg0 -j ACCEPT
+    iptables -A FORWARD -i awg0 -o $MAIN_INTERFACE -j ACCEPT
+
+    # تنظیم MSS جهت جلوگیری از افت سرعت و عدم لود صفحات
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+    # استثنا کردن پورت تانل و فوروارد صحیح UDP/TCP به سرور خارج
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp --dport $AWG_PORT -j ACCEPT
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp ! --dport $AWG_PORT -j DNAT --to-destination 10.0.0.1
+    
     iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
@@ -133,8 +148,15 @@ elif [[ "$LOCATION" == "2" ]]; then
     awg set awg0 peer "$IRAN_PUBKEY" endpoint "$IP_IRAN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev awg0 up
 
+    # تنظیمات صحیح IPTables در سرور خارج
+    iptables -F FORWARD
+    iptables -t nat -F POSTROUTING
+
+    iptables -A INPUT -i awg0 -j ACCEPT
     iptables -A FORWARD -i awg0 -j ACCEPT
     iptables -A FORWARD -o awg0 -j ACCEPT
+    
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
     echo -e "${GREEN}[+] Foreign server configured successfully!${RESET}"
