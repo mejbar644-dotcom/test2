@@ -9,11 +9,15 @@ RESET=$(tput sgr0)
 echo -e "${CYAN}"
 echo "===================================="
 echo "          GitHub: Netplas"
-echo "  AmneziaWG Anti-Filter Tunnel v5"
+echo "  AmneziaWG Anti-Filter Tunnel v6.1"
+echo "        (Safe SSH Edition)"
 echo "===================================="
 echo -e "${RESET}"
 
-# بررسی نصب بودن amneziawg و iptables
+# پیدا کردن پورت فعال SSH جهت جلوگیری از قطع دسترسی
+SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F':' '{print $NF}' | head -n1)
+SSH_PORT=${SSH_PORT:-22}
+
 if ! command -v awg &> /dev/null; then
     echo "[*] Installing AmneziaWG and iptables..."
     apt-get update
@@ -31,9 +35,20 @@ read -p "Enter your choice (1, 2 or 3): " LOCATION
 
 if [[ "$LOCATION" == "3" ]]; then
     echo -e "${RED}[*] Uninstalling and cleaning up AmneziaWG tunnel...${RESET}"
+    
+    systemctl disable netplas-tunnel.service 2>/dev/null
+    systemctl stop netplas-tunnel.service 2>/dev/null
+    rm -f /etc/systemd/system/netplas-tunnel.service
+    systemctl daemon-reload
+    
     ip link set awg0 down 2>/dev/null
     ip link del awg0 2>/dev/null
     rm -rf /etc/amnezia
+    
+    # اعمال Policy ایمن
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
     
     iptables -F
     iptables -X
@@ -42,7 +57,7 @@ if [[ "$LOCATION" == "3" ]]; then
     iptables -t mangle -F
     iptables -t mangle -X
     
-    echo -e "${GREEN}[+] Tunnel removed successfully!${RESET}"
+    echo -e "${GREEN}[+] Tunnel and auto-start service removed successfully!${RESET}"
     exit 0
 fi
 
@@ -53,8 +68,8 @@ AWG_PORT=${AWG_PORT:-51820}
 
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
 
-# حذف اینترفیس قبلی
 ip link del awg0 2>/dev/null
+mkdir -p /etc/amnezia/scripts
 
 if [[ "$LOCATION" == "1" ]]; then
     echo -e "${YELLOW}[*] Configuring IRAN server with AmneziaWG...${RESET}"
@@ -85,30 +100,44 @@ if [[ "$LOCATION" == "1" ]]; then
     awg set awg0 peer "$FOREIGN_PUBKEY" endpoint "$IP_FOREIGN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev awg0 up
 
-    # پاکسازی کامل قوانین قبلی
-    iptables -F
-    iptables -t nat -F
-    iptables -t mangle -F
+    # اسکریپت امن سرور ایران
+    cat <<EOF > /etc/amnezia/scripts/start-netplas.sh
+#!/bin/bash
+sysctl -w net.ipv4.ip_forward=1 > /dev/null
+ip link set dev awg0 up 2>/dev/null || true
 
-    # اجازه عبور ترافیک‌های ورودی و خروجی
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
+# ۱. اول ایمن‌سازی سیاست‌های اصلی
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
 
-    # تنظیم MSS برای جلوگیری از شکستن بسته‌ها
-    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+# ۲. پاکسازی جداول
+iptables -F
+iptables -t nat -F
+iptables -t mangle -F
 
-    # استثنا کردن پورت تانل و پورت‌های مدیریت سرور ایران
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp --dport $AWG_PORT -j ACCEPT
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp --dport $AWG_PORT -j ACCEPT
-    
-    # فوروارد کردن کل ترافیک به سرور خارج (به جز پورت‌های SSH و وب‌سرور)
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp ! --dports $AWG_PORT -j DNAT --to-destination 10.0.0.1
-    
-    # ماسکرید ترافیک
-    iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
-    iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
+# ۳. تضمین دسترسی به SSH و کارت شبکه محلی
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# ۴. قوانین تانل و MSS Clamping
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
+# ۵. استثنا کردن پورت تانل و SSH از DNAT
+iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp --dport $AWG_PORT -j ACCEPT
+iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp --dport $AWG_PORT -j ACCEPT
+
+# ۶. هدایت ترافیک به سرور خارج (استثنا کردن پورت SSH و وب‌سرور)
+iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports $SSH_PORT,80,10052 -j DNAT --to-destination 10.0.0.1
+iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp ! --dports $AWG_PORT -j DNAT --to-destination 10.0.0.1
+
+iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
+EOF
+
+    chmod +x /etc/amnezia/scripts/start-netplas.sh
+    /etc/amnezia/scripts/start-netplas.sh
 
     echo -e "${GREEN}[+] Iran server configured successfully!${RESET}"
     echo -e "Your Iran Server Public Key: ${CYAN}$PubKey${RESET}"
@@ -150,17 +179,30 @@ elif [[ "$LOCATION" == "2" ]]; then
     awg set awg0 peer "$IRAN_PUBKEY" endpoint "$IP_IRAN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev awg0 up
 
-    # پاکسازی و اعمال قوانین سرور خارج
-    iptables -F
-    iptables -t nat -F
-    iptables -t mangle -F
+    # اسکریپت امن سرور خارج
+    cat <<EOF > /etc/amnezia/scripts/start-netplas.sh
+#!/bin/bash
+sysctl -w net.ipv4.ip_forward=1 > /dev/null
+ip link set dev awg0 up 2>/dev/null || true
 
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
 
-    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-    iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
+iptables -F
+iptables -t nat -F
+iptables -t mangle -F
+
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
+EOF
+
+    chmod +x /etc/amnezia/scripts/start-netplas.sh
+    /etc/amnezia/scripts/start-netplas.sh
 
     echo -e "${GREEN}[+] Foreign server configured successfully!${RESET}"
 
@@ -168,3 +210,26 @@ else
     echo -e "${RED}[!] Invalid selection. Please enter 1, 2 or 3.${RESET}"
     exit 1
 fi
+
+# ساخت خودکار و امن سرویس Systemd
+echo -e "${YELLOW}[*] Creating and enabling Systemd auto-start service...${RESET}"
+
+cat <<EOF > /etc/systemd/system/netplas-tunnel.service
+[Unit]
+Description=Netplas AmneziaWG Tunnel Auto-Start
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/etc/amnezia/scripts/start-netplas.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable netplas-tunnel.service > /dev/null 2>&1
+
+echo -e "${GREEN}[+] Systemd service created & enabled without affecting SSH!${RESET}"
