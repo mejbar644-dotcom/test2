@@ -1,26 +1,21 @@
 #!/bin/bash
 
-CYAN='\033[1;36m'
-YELLOW='\033[1;33m'
-GREEN='\033[1;32m'
-RED='\033[1;31m'
-PURPLE='\033[1;35m'
-NC='\033[0m'
+CYAN=$(tput setaf 6)
+YELLOW=$(tput setaf 3)
+GREEN=$(tput setaf 2)
+RED=$(tput setaf 1)
+RESET=$(tput sgr0)
 
-clear
-echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║            GitHub: Netplas                 ║${NC}"
-echo -e "${CYAN}║     AmneziaWG Anti-Filter Tunnel v4.4      ║${NC}"
-echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
-echo ""
+echo -e "${CYAN}"
+echo "===================================="
+echo "          GitHub: Netplas"
+echo "  AmneziaWG Anti-Filter Tunnel v4"
+echo "===================================="
+echo -e "${RESET}"
 
-if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}[!] Please run this script as root (sudo)!${NC}"
-  exit 1
-fi
-
-if ! command -v awg &> /dev/null || ! command -v awg-keygen &> /dev/null; then
-    echo -e "${YELLOW}[*] Installing AmneziaWG and dependencies...${NC}"
+# بررسی نصب بودن amneziawg و iptables
+if ! command -v awg &> /dev/null; then
+    echo "[*] Installing AmneziaWG and iptables..."
     apt-get update
     apt-get install -y curl wget iptables software-properties-common
     add-apt-repository -y ppa:amnezia/ppa &>/dev/null
@@ -28,140 +23,123 @@ if ! command -v awg &> /dev/null || ! command -v awg-keygen &> /dev/null; then
     apt-get install -y amneziawg amneziawg-tools
 fi
 
-echo -e "${PURPLE}Select an option:${NC}"
-echo -e "  ${GREEN}1${NC} - IRAN Server Configuration"
-echo -e "  ${GREEN}2${NC} - FOREIGN Server Configuration"
-echo -e "  ${RED}3${NC} - Uninstall & Remove Tunnel Completely"
-echo ""
+echo "Select an option:"
+echo "1 - IRAN Server Configuration"
+echo "2 - FOREIGN Server Configuration"
+echo "3 - Uninstall & Remove Tunnel"
 read -p "Enter your choice (1, 2 or 3): " LOCATION
 
 if [[ "$LOCATION" == "3" ]]; then
-    echo -e "${RED}[*] Uninstalling and cleaning up AmneziaWG tunnel...${NC}"
-    systemctl stop awg-quick@awg0 2>/dev/null
-    systemctl disable awg-quick@awg0 2>/dev/null
-    rm -rf /etc/amnezia/amneziawg
-    iptables -F
-    iptables -X
-    iptables -t nat -F
-    iptables -t nat -X
-    iptables -t mangle -F
-    iptables -t mangle -X
-    iptables -P INPUT ACCEPT
-    iptables -P FORWARD ACCEPT
-    iptables -P OUTPUT ACCEPT
-    sysctl -w net.ipv4.ip_forward=0
-    echo -e "${GREEN}[+] Tunnel and all configurations removed successfully!${NC}"
+    echo -e "${RED}[*] Uninstalling and cleaning up AmneziaWG tunnel...${RESET}"
+    ip link set awg0 down 2>/dev/null
+    ip link del awg0 2>/dev/null
+    rm -rf /etc/amnezia
+    
+    # پاکسازی ایمن قوانین مرتبط با awg0
+    iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null
+    iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null
+    iptables -t nat -D POSTROUTING -o awg0 -j MASQUERADE 2>/dev/null
+    
+    echo -e "${GREEN}[+] Tunnel removed successfully!${RESET}"
     exit 0
 fi
 
-read -p "Enter IRAN server public IP: " IP_IRAN
-read -p "Enter FOREIGN server public IP: " IP_FOREIGN
-read -p "Enter AmneziaWG Port (Default 443): " AWG_PORT
-AWG_PORT=${AWG_PORT:-443}
+read -p "Enter IRAN server IP: " IP_IRAN
+read -p "Enter FOREIGN server IP: " IP_FOREIGN
+read -p "Enter AmneziaWG Port (Default 51820): " AWG_PORT
+AWG_PORT=${AWG_PORT:-51820}
 
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
-CURRENT_SSH_PORT=$(ss -tlnp | grep sshd | awk '{print $4}' | awk -F':' '{print $NF}' | head -n1)
-CURRENT_SSH_PORT=${CURRENT_SSH_PORT:-22}
 
-systemctl stop awg-quick@awg0 2>/dev/null
+# حذف اینترفیس قبلی در صورت وجود
 ip link del awg0 2>/dev/null
-mkdir -p /etc/amnezia/amneziawg
 
 if [[ "$LOCATION" == "1" ]]; then
-    echo -e "${YELLOW}[*] Configuring IRAN server permanently...${NC}"
+    echo -e "${YELLOW}[*] Configuring IRAN server with AmneziaWG...${RESET}"
 
     PrivKey=$(awg genkey)
     PubKey=$(echo "$PrivKey" | awg pubkey)
 
-    # نمایش کلید عمومی در همان ابتدا تا از دست نرود
-    echo ""
-    echo -e "${GREEN}==================================================${NC}"
-    echo -e "Your Iran Server Public Key is: ${CYAN}$PubKey${NC}"
-    echo -e "${GREEN}==================================================${NC}"
-    echo ""
-
+    echo -e "${YELLOW}[?] Please run the Foreign server script first.${RESET}"
     read -p "Enter FOREIGN server Public Key: " FOREIGN_PUBKEY
+    
+    # دریافت مقادیر تصادفی H1 تا H4 تولید شده در سرور خارج
+    read -p "Enter H1 value from Foreign server: " H1
+    read -p "Enter H2 value from Foreign server: " H2
+    read -p "Enter H3 value from Foreign server: " H3
+    read -p "Enter H4 value from Foreign server: " H4
 
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
-    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ipforward.conf
 
-    cat <<EOF > /etc/amnezia/amneziawg/awg0.conf
-[Interface]
-Address = 10.0.0.2/30
-PrivateKey = $PrivKey
-ListenPort = $AWG_PORT
-MTU = 1280
-Jc = 4
-Jmin = 50
-Jmax = 1000
-S1 = 55
-S2 = 75
-H1 = 12345678
-H2 = 87654321
-H3 = 13579246
-H4 = 24681357
+    ip link add dev awg0 type amneziawg
+    ip address add 10.0.0.2/30 dev awg0
+    ip link set dev awg0 mtu 1360
+    
+    mkdir -p /etc/amnezia/amneziawg
+    echo "$PrivKey" > /etc/amnezia/amneziawg/private.key
+    
+    awg set awg0 listen-port $AWG_PORT private-key /etc/amnezia/amneziawg/private.key \
+        jc 4 jmin 50 jmax 1000 s1 55 s2 75 h1 $H1 h2 $H2 h3 $H3 h4 $H4
+    
+    awg set awg0 peer "$FOREIGN_PUBKEY" endpoint "$IP_FOREIGN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
+    ip link set dev awg0 up
 
-[Peer]
-PublicKey = $FOREIGN_PUBKEY
-Endpoint = $IP_FOREIGN:$AWG_PORT
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-EOF
-
-    iptables -t nat -F
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports ${CURRENT_SSH_PORT},22,80,443,10052 -j DNAT --to-destination 10.0.0.1
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -m multiport ! --dports ${AWG_PORT} -j DNAT --to-destination 10.0.0.1
+    # پاکسازی و اعمال IPTables (استثنا کردن پورت اصلی تانل جهت جلوگیری از Loop)
+    iptables -t nat -F PREROUTING
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp --dport $AWG_PORT -j ACCEPT
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -j DNAT --to-destination 10.0.0.1
     iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
-    systemctl enable --now awg-quick@awg0
-
-    echo -e "${GREEN}[+] Iran server configured and running permanently!${NC}"
+    echo -e "${GREEN}[+] Iran server configured successfully!${RESET}"
+    echo -e "Your Iran Server Public Key: ${CYAN}$PubKey${RESET}"
 
 elif [[ "$LOCATION" == "2" ]]; then
-    echo -e "${YELLOW}[*] Configuring FOREIGN server permanently...${NC}"
+    echo -e "${YELLOW}[*] Configuring FOREIGN server with AmneziaWG...${RESET}"
 
     PrivKey=$(awg genkey)
     PubKey=$(echo "$PrivKey" | awg pubkey)
 
-    echo -e "Your Foreign Server Public Key is: ${CYAN}$PubKey${NC}"
-    echo ""
+    # تولید اعداد تصادفی ۳۲ بیتی برای هدرها
+    H1=$(shuf -i 100000000-2147483647 -n 1)
+    H2=$(shuf -i 100000000-2147483647 -n 1)
+    H3=$(shuf -i 100000000-2147483647 -n 1)
+    H4=$(shuf -i 100000000-2147483647 -n 1)
+
+    echo -e "Your Foreign Server Public Key is: ${CYAN}$PubKey${RESET}"
+    echo -e "${YELLOW}--- Save these H-Header values for IRAN server setup ---${RESET}"
+    echo -e "H1: ${CYAN}$H1${RESET}"
+    echo -e "H2: ${CYAN}$H2${RESET}"
+    echo -e "H3: ${CYAN}$H3${RESET}"
+    echo -e "H4: ${CYAN}$H4${RESET}"
+    echo -e "-------------------------------------------------------"
+    read -p "Press Enter after you have saved these values..."
+
     read -p "Enter IRAN server Public Key: " IRAN_PUBKEY
 
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
-    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ipforward.conf
 
-    cat <<EOF > /etc/amnezia/amneziawg/awg0.conf
-[Interface]
-Address = 10.0.0.1/30
-PrivateKey = $PrivKey
-ListenPort = $AWG_PORT
-MTU = 1280
-Jc = 4
-Jmin = 50
-Jmax = 1000
-S1 = 55
-S2 = 75
-H1 = 12345678
-H2 = 87654321
-H3 = 13579246
-H4 = 24681357
-
-[Peer]
-PublicKey = $IRAN_PUBKEY
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-EOF
+    ip link add dev awg0 type amneziawg
+    ip address add 10.0.0.1/30 dev awg0
+    ip link set dev awg0 mtu 1360
+    
+    mkdir -p /etc/amnezia/amneziawg
+    echo "$PrivKey" > /etc/amnezia/amneziawg/private.key
+    
+    awg set awg0 listen-port $AWG_PORT private-key /etc/amnezia/amneziawg/private.key \
+        jc 4 jmin 50 jmax 1000 s1 55 s2 75 h1 $H1 h2 $H2 h3 $H3 h4 $H4
+    
+    awg set awg0 peer "$IRAN_PUBKEY" endpoint "$IP_IRAN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
+    ip link set dev awg0 up
 
     iptables -A FORWARD -i awg0 -j ACCEPT
     iptables -A FORWARD -o awg0 -j ACCEPT
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
-    systemctl enable --now awg-quick@awg0
-
-    echo -e "${GREEN}[+] Foreign server configured and running permanently!${NC}"
+    echo -e "${GREEN}[+] Foreign server configured successfully!${RESET}"
 
 else
-    echo -e "${RED}[!] Invalid selection. Please enter 1, 2 or 3.${NC}"
+    echo -e "${RED}[!] Invalid selection. Please enter 1, 2 or 3.${RESET}"
     exit 1
 fi
