@@ -60,7 +60,7 @@ if [[ "$LOCATION" == "1" ]]; then
     echo -e "UUID: ${CYAN}$UUID${RESET}"
     echo -e "Public Key: ${CYAN}$PUBLIC_KEY${RESET}"
     echo -e "Short ID: ${CYAN}$SHORT_ID${RESET}"
-    echo -e "${GREEN-----------------------------------------------${RESET}"
+    echo -e "${GREEN}-----------------------------------------------${RESET}"
 
     # ایجاد کانفیگ سرور خارج
     cat << EOF > /usr/local/etc/xray/config.json
