@@ -14,7 +14,7 @@ fi
 echo -e "${CYAN}"
 echo "===================================="
 echo "          GitHub: Netplas"
-echo "  AmneziaWG Anti-Filter Tunnel v3.2"
+echo "  AmneziaWG Anti-Filter Tunnel v3.3"
 echo "===================================="
 echo -e "${RESET}"
 
@@ -34,17 +34,30 @@ echo "2 - FOREIGN Server Configuration"
 echo "3 - Uninstall & Remove Tunnel"
 read -p "Enter your choice (1, 2 or 3): " LOCATION
 
-# رنج آی‌پی داخلی جدید برای تونل
+# رنج آی‌پی داخلی ثابت برای تونل
 TUNNEL_IP_IRAN="172.28.14.2"
 TUNNEL_IP_FOREIGN="172.28.14.1"
+
+# مقادیر پنهان‌سازی ثابت و مقاوم در برابر DPI (باید در هر دو سرور دقیقاً یکسان باشد)
+FIXED_JC=5
+FIXED_JMIN=45
+FIXED_JMAX=750
+FIXED_S1=52
+FIXED_S2=95
+FIXED_H1=34851290
+FIXED_H2=71520489
+FIXED_H3=12948301
+FIXED_H4=89234105
+
+MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
 
 if [[ "$LOCATION" == "3" ]]; then
     echo -e "${RED}[*] Uninstalling and cleaning up AmneziaWG tunnel...${RESET}"
     ip link set awg0 down 2>/dev/null
     ip link del awg0 2>/dev/null
     rm -rf /etc/amnezia
-    iptables -t nat -D PREROUTING -i $(ip route show default | awk '/default/ {print $5}' | head -n1) -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination $TUNNEL_IP_FOREIGN 2>/dev/null
-    iptables -t nat -D PREROUTING -i $(ip route show default | awk '/default/ {print $5}' | head -n1) -p udp -j DNAT --to-destination $TUNNEL_IP_FOREIGN 2>/dev/null
+    iptables -t nat -D PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination $TUNNEL_IP_FOREIGN 2>/dev/null
+    iptables -t nat -D PREROUTING -i $MAIN_INTERFACE -p udp -j DNAT --to-destination $TUNNEL_IP_FOREIGN 2>/dev/null
     iptables -t nat -F POSTROUTING
     sysctl -w net.ipv4.ip_forward=0
     echo -e "${GREEN}[+] Tunnel and all configurations removed successfully!${RESET}"
@@ -56,19 +69,6 @@ read -p "Enter FOREIGN server IP: " IP_FOREIGN
 
 read -p "Enter AmneziaWG Port (Default 51820): " AWG_PORT
 AWG_PORT=${AWG_PORT:-51820}
-
-MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
-
-# تولید مقادیر تصادفی و متغیر برای پنهان‌سازی (جهت جلوگیری از شناسایی DPI)
-RAND_JC=$(( ( RANDOM % 6 ) + 3 ))       # عددی بین 3 تا 8
-RAND_JMIN=$(( ( RANDOM % 40 ) + 30 ))   # عددی بین 30 تا 70
-RAND_JMAX=$(( ( RANDOM % 500 ) + 500 )) # عددی بین 500 تا 1000
-RAND_S1=$(( ( RANDOM % 50 ) + 35 ))     # عددی بین 35 تا 85
-RAND_S2=$(( ( RANDOM % 50 ) + 86 ))     # عددی بین 86 تا 135
-RAND_H1=$(( ( RANDOM % 89999999 ) + 10000000 )) # عدد 8 رقمی تصادفی
-RAND_H2=$(( ( RANDOM % 89999999 ) + 10000000 ))
-RAND_H3=$(( ( RANDOM % 89999999 ) + 10000000 ))
-RAND_H4=$(( ( RANDOM % 89999999 ) + 10000000 ))
 
 # حذف اینترفیس قبلی در صورت وجود
 ip link del awg0 2>/dev/null
@@ -92,7 +92,7 @@ if [[ "$LOCATION" == "1" ]]; then
     chmod 600 /etc/amnezia/amneziawg/private.key
     
     awg set awg0 listen-port $AWG_PORT private-key /etc/amnezia/amneziawg/private.key \
-        jc $RAND_JC jmin $RAND_JMIN jmax $RAND_JMAX s1 $RAND_S1 s2 $RAND_S2 h1 $RAND_H1 h2 $RAND_H2 h3 $RAND_H3 h4 $RAND_H4
+        jc $FIXED_JC jmin $FIXED_JMIN jmax $FIXED_JMAX s1 $FIXED_S1 s2 $FIXED_S2 h1 $FIXED_H1 h2 $FIXED_H2 h3 $FIXED_H3 h4 $FIXED_H4
     
     awg set awg0 peer "$FOREIGN_PUBKEY" endpoint "$IP_FOREIGN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev awg0 up
@@ -104,7 +104,7 @@ if [[ "$LOCATION" == "1" ]]; then
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
     netfilter-persistent save
 
-    echo -e "${GREEN}[+] Iran server configured successfully with randomized anti-filter parameters!${RESET}"
+    echo -e "${GREEN}[+] Iran server configured successfully with fixed anti-filter parameters!${RESET}"
     echo "Your Iran Server Public Key: $PubKey"
 
 elif [[ "$LOCATION" == "2" ]]; then
@@ -128,7 +128,7 @@ elif [[ "$LOCATION" == "2" ]]; then
     chmod 600 /etc/amnezia/amneziawg/private.key
     
     awg set awg0 listen-port $AWG_PORT private-key /etc/amnezia/amneziawg/private.key \
-        jc $RAND_JC jmin $RAND_JMIN jmax $RAND_JMAX s1 $RAND_S1 s2 $RAND_S2 h1 $RAND_H1 h2 $RAND_H2 h3 $RAND_H3 h4 $RAND_H4
+        jc $FIXED_JC jmin $FIXED_JMIN jmax $FIXED_JMAX s1 $FIXED_S1 s2 $FIXED_S2 h1 $FIXED_H1 h2 $FIXED_H2 h3 $FIXED_H3 h4 $FIXED_H4
     
     awg set awg0 peer "$IRAN_PUBKEY" endpoint "$IP_IRAN:$AWG_PORT" allowed-ips 0.0.0.0/0 persistent-keepalive 25
     ip link set dev awg0 up
@@ -138,7 +138,7 @@ elif [[ "$LOCATION" == "2" ]]; then
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
     netfilter-persistent save
 
-    echo -e "${GREEN}[+] Foreign server configured successfully with randomized anti-filter parameters!${RESET}"
+    echo -e "${GREEN}[+] Foreign server configured successfully with fixed anti-filter parameters!${RESET}"
 
 else
     echo -e "${RED}[!] Invalid selection. Please enter 1, 2 or 3.${RESET}"
