@@ -3,28 +3,21 @@ bash <(cat << 'EOF'
 
 clear
 echo "===================================================="
-echo "    Netplas Xray-Reality Automated Setup Script     "
+echo "    Netplas Xray-Reality Foreign Server Setup       "
 echo "===================================================="
 echo
-
-read -p "لطفاً آی‌پی سرور خارج (Foreign Server IP) را وارد کنید: " IP_FOREIGN
-
-if [ -z "$IP_FOREIGN" ]; then
-    echo "خطا: آی‌پی وارد نشده است!"
-    exit 1
-fi
-
-# ثابت‌ها و کلیدهای از پیش‌تایید شده
-UUID="7f2b6886-4602-441b-a256-d31ca2a3fd74"
-PUBLIC_KEY="juncreRBxxUYaV6PA1aQNPzyx4tS9MjeKpVcv5vtxy8"
-SHORT_ID="7da10f5b"
 
 echo "[+] در حال نصب و به‌روزرسانی Xray..."
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install > /dev/null 2>&1
 
-MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
+echo "[+] در حال تولید کلیدهای امنیتی X25519..."
+KEYS=$(xray x25519)
+PRIVATE_KEY=$(echo "$KEYS" | grep "PrivateKey" | awk '{print $2}')
+PUBLIC_KEY=$(echo "$KEYS" | grep "Password" | awk '{print $3}')
+UUID=$(cat /proc/sys/kernel/random/uuid)
+SHORT_ID=$(openssl rand -hex 4)
 
-echo "[+] در حال تنظیم کانگفیگ Xray روی سرور ایران..."
+echo "[+] در حال تنظیم کانفیگ Xray..."
 cat << INNER_EOF > /usr/local/etc/xray/config.json
 {
   "log": {
@@ -32,69 +25,56 @@ cat << INNER_EOF > /usr/local/etc/xray/config.json
   },
   "inbounds": [
     {
-      "listen": "127.0.0.1",
-      "port": 1080,
-      "protocol": "socks",
-      "settings": {
-        "auth": "noauth",
-        "udp": true
-      }
-    }
-  ],
-  "outbounds": [
-    {
+      "listen": "0.0.0.0",
+      "port": 443,
       "protocol": "vless",
       "settings": {
-        "vnext": [
+        "clients": [
           {
-            "address": "$IP_FOREIGN",
-            "port": 443,
-            "users": [
-              {
-                "id": "$UUID",
-                "encryption": "none"
-              }
-            ]
+            "id": "$UUID"
           }
-        ]
+        ],
+        "decryption": "none"
       },
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "publicKey": "$PUBLIC_KEY",
-          "fingerprint": "chrome",
-          "serverName": "dl.google.com",
-          "shortId": "$SHORT_ID"
+          "show": false,
+          "dest": "dl.google.com:443",
+          "xver": 0,
+          "serverNames": [
+            "dl.google.com",
+            "www.google.com"
+          ],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": [
+            "$SHORT_ID"
+          ]
         }
       }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom"
     }
   ]
 }
 INNER_EOF
 
-sysctl -w net.ipv4.ip_forward=1 > /dev/null
-echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-ip-forward.conf
-
 systemctl restart xray
 systemctl enable xray > /dev/null 2>&1
 
-echo "[+] در حال اعمال قوانین NAT و IPTables..."
-iptables -t nat -F
-iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 127.0.0.1
-iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -j DNAT --to-destination 127.0.0.1
-iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
-
-# ذخیره قوانین iptables
-apt-get install -y iptables-persistent > /dev/null 2>&1
-netfilter-persistent save > /dev/null 2>&1
-
 echo
 echo "===================================================="
-echo "         راه‌اندازی با موفقیت به پایان رسید!          "
+echo "      تنظیمات سرور خارج با موفقیت انجام شد!         "
 echo "===================================================="
-echo "حالا می‌توانید دستور زیر را برای تست اتصال اجرا کنید:"
-echo "curl -x socks5://127.0.0.1:1080 http://104.16.132.229"
+echo "این اطلاعات را برای سرور ایران نیاز دارید:"
+echo "----------------------------------------------------"
+echo -e "UUID: \e[32m$UUID\e[0m"
+echo -e "Public Key: \e[32m$PUBLIC_KEY\e[0m"
+echo -e "Short ID: \e[32m$SHORT_ID\e[0m"
 echo "===================================================="
 EOF
 )
