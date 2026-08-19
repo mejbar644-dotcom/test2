@@ -9,17 +9,21 @@ RESET=$(tput sgr0)
 echo -e "${CYAN}"
 echo "===================================="
 echo "          GitHub: Netplas"
-echo "    Wstunnel Setup Script v3"
+echo "    Wstunnel Setup Script v4"
 echo "===================================="
 echo -e "${RESET}"
 
-# نصب پیش‌نیازها
+# نصب پیش‌نیازها و دانلود آخرین نسخه معتبر wstunnel
 if ! command -v wstunnel &> /dev/null; then
     echo "[*] Installing wstunnel..."
-    apt-get update && apt-get install -y curl wget systemd
-    # دانلود مستقیم باینری استاندارد
-    wget -q -O /usr/local/bin/wstunnel "https://github.com/erebe/wstunnel/releases/download/v9.2.3/wstunnel-x86_64-linux"
+    apt-get update && apt-get install -y curl wget systemdtar
+    
+    # دانلود پکیج tar.gz نسخه جدید و استخراج فایل اجرایی
+    wget -q -O /tmp/wstunnel.tar.gz "https://github.com/erebe/wstunnel/releases/download/v10.6.2/wstunnel_10.6.2_linux_amd64.tar.gz"
+    tar -xzf /tmp/wstunnel.tar.gz -C /tmp/
+    mv /tmp/wstunnel /usr/local/bin/wstunnel
     chmod +x /usr/local/bin/wstunnel
+    rm -f /tmp/wstunnel.tar.gz
 fi
 
 echo "Select server role:"
@@ -76,7 +80,6 @@ EOF
 
     systemctl daemon-reload && systemctl restart wstunnel-client && systemctl enable wstunnel-client
     echo -e "${GREEN}[+] Iran client connected to $IP_FOREIGN!${RESET}"
-    echo -e "${CYAN}Check status with: systemctl status wstunnel-client${RESET}"
 
 elif [[ "$CHOICE" == "3" ]]; then
     systemctl stop wstunnel-server wstunnel-client 2>/dev/null
