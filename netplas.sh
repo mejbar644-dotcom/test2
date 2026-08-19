@@ -9,7 +9,7 @@ RESET=$(tput sgr0)
 echo -e "${CYAN}"
 echo "===================================="
 echo "          GitHub: Netplas"
-echo "     Hysteria 2 Tunnel Setup"
+echo "     Hysteria 2 Tunnel Setup v2"
 echo "===================================="
 echo -e "${RESET}"
 
@@ -18,6 +18,39 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+# بررسی و نصب پیش‌نیازها
+echo -e "${YELLOW}[*] Checking system dependencies...${RESET}"
+MISSING_DEPS=()
+
+for cmd in curl wget iptables openssl; do
+    if ! command -v "$cmd" &> /dev/null; then
+        MISSING_DEPS+=("$cmd")
+    fi
+done
+
+if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
+    echo -e "${YELLOW}[*] Installing missing dependencies: ${MISSING_DEPS[*]}...${RESET}"
+    apt-get update -y
+    apt-get install -y "${MISSING_DEPS[@]}" software-properties-common
+else
+    echo -e "${GREEN}[+] All basic dependencies are already installed.${RESET}"
+fi
+
+# بررسی نصب بودن هسته Hysteria
+if ! command -v hysteria &> /dev/null; then
+    echo -e "${YELLOW}[*] Hysteria 2 is not installed. Installing...${RESET}"
+    bash <(curl -fsSL https://get.hy2.sh/) &>/dev/null
+    if command -v hysteria &> /dev/null; then
+        echo -e "${GREEN}[+] Hysteria 2 installed successfully.${RESET}"
+    else
+        echo -e "${RED}[!] Failed to install Hysteria 2. Please check your internet connection.${RESET}"
+        exit 1
+    fi
+else
+    echo -e "${GREEN}[+] Hysteria 2 is already installed. Skipping installation.${RESET}"
+fi
+
+echo ""
 echo "Select an option:"
 echo "1 - IRAN Server Configuration (Client/Forwarder)"
 echo "2 - FOREIGN Server Configuration (Server)"
@@ -33,12 +66,6 @@ if [[ "$LOCATION" == "3" ]]; then
     rm -f /usr/local/bin/hysteria
     echo -e "${GREEN}[+] Hysteria 2 removed successfully!${RESET}"
     exit 0
-fi
-
-# نصب خودکار هسته هیستاریا اگر نصب نباشد
-if ! command -v hysteria &> /dev/null; then
-    echo "[*] Installing Hysteria 2 binary..."
-    bash <(curl -fsSL https://get.hy2.sh/) &>/dev/null
 fi
 
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
@@ -150,7 +177,6 @@ EOF
     # فعال‌سازی فوروارد پورت‌ها از سرور ایران به سرور خارج با استفاده از iptables
     sysctl -w net.ipv4.ip_forward=1 > /dev/null
     iptables -t nat -F
-    # هدایت ترافیک پورت‌های ورودی (به جز پورت‌های مدیریت مثل 22، 80، 10052) به سمت لوکال یا تونل
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 127.0.0.1
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -m multiport ! --dports 53 -j DNAT --to-destination 127.0.0.1
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
