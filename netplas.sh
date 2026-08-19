@@ -9,16 +9,15 @@ RESET=$(tput sgr0)
 echo -e "${CYAN}"
 echo "===================================="
 echo "          GitHub: Netplas"
-echo "    Wstunnel Setup Script v4"
+echo "    Wstunnel Setup Script v5"
 echo "===================================="
 echo -e "${RESET}"
 
 # نصب پیش‌نیازها و دانلود آخرین نسخه معتبر wstunnel
 if ! command -v wstunnel &> /dev/null; then
     echo "[*] Installing wstunnel..."
-    apt-get update && apt-get install -y curl wget systemdtar
+    apt-get update && apt-get install -y curl wget systemd
     
-    # دانلود پکیج tar.gz نسخه جدید و استخراج فایل اجرایی
     wget -q -O /tmp/wstunnel.tar.gz "https://github.com/erebe/wstunnel/releases/download/v10.6.2/wstunnel_10.6.2_linux_amd64.tar.gz"
     tar -xzf /tmp/wstunnel.tar.gz -C /tmp/
     mv /tmp/wstunnel /usr/local/bin/wstunnel
@@ -70,7 +69,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/local/bin/wstunnel client -L udp://127.0.0.1:$LOCAL_PORT:127.0.0.1:$LOCAL_PORT wss://$IP_FOREIGN:443
+ExecStart=/usr/local/bin/wstunnel client -L udp://127.0.0.1:$LOCAL_PORT:127.0.0.1:$LOCAL_PORT ws://$IP_FOREIGN:443
 Restart=always
 RestartSec=3
 
@@ -79,7 +78,7 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload && systemctl restart wstunnel-client && systemctl enable wstunnel-client
-    echo -e "${GREEN}[+] Iran client connected to $IP_FOREIGN!${RESET}"
+    echo -e "${GREEN}[+] Iran client connected to $IP_FOREIGN using ws:// protocol!${RESET}"
 
 elif [[ "$CHOICE" == "3" ]]; then
     systemctl stop wstunnel-server wstunnel-client 2>/dev/null
