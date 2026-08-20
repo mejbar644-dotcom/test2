@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# AmneziaWG Anti-Filter Tunnel v4 (Improved)
+# GitHub style: Netplas / Improved by Grok
+
+set -euo pipefail
+
 CYAN=$(tput setaf 6)
 YELLOW=$(tput setaf 3)
 GREEN=$(tput setaf 2)
@@ -7,187 +12,215 @@ RED=$(tput setaf 1)
 RESET=$(tput sgr0)
 
 echo -e "${CYAN}"
-echo "===================================="
-echo "          GitHub: Netplas"
-echo "     Hysteria 2 Tunnel Setup v2"
-echo "===================================="
+echo "========================================"
+echo "     AmneziaWG Anti-Filter Tunnel v4"
+echo "========================================"
 echo -e "${RESET}"
 
-if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}[!] Please run this script as root (sudo).${RESET}"
-  exit 1
-fi
+# ---------- توابع کمکی ----------
+generate_random_params() {
+    JC=$((3 + RANDOM % 5))          # 3-7
+    JMIN=$((40 + RANDOM % 40))      # 40-79
+    JMAX=$((JMIN + 200 + RANDOM % 800))  # بزرگ‌تر از JMIN
+    S1=$((40 + RANDOM % 60))
+    S2=$((40 + RANDOM % 60))
+    H1=$((RANDOM * RANDOM))
+    H2=$((RANDOM * RANDOM))
+    H3=$((RANDOM * RANDOM))
+    H4=$((RANDOM * RANDOM))
+}
 
-# بررسی و نصب پیش‌نیازها
-echo -e "${YELLOW}[*] Checking system dependencies...${RESET}"
-MISSING_DEPS=()
-
-for cmd in curl wget iptables openssl; do
-    if ! command -v "$cmd" &> /dev/null; then
-        MISSING_DEPS+=("$cmd")
+save_iptables() {
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save
     fi
-done
+}
 
-if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
-    echo -e "${YELLOW}[*] Installing missing dependencies: ${MISSING_DEPS[*]}...${RESET}"
-    apt-get update -y
-    apt-get install -y "${MISSING_DEPS[@]}" software-properties-common
-else
-    echo -e "${GREEN}[+] All basic dependencies are already installed.${RESET}"
+# ---------- نصب پیش‌نیاز ----------
+if ! command -v awg &>/dev/null; then
+    echo -e "${YELLOW}[*] Installing AmneziaWG and dependencies...${RESET}"
+    apt-get update -qq
+    apt-get install -y curl wget iptables iptables-persistent software-properties-common
+    add-apt-repository -y ppa:amnezia/ppa &>/dev/null || true
+    apt-get update -qq
+    apt-get install -y amneziawg amneziawg-tools
 fi
 
-# بررسی نصب بودن هسته Hysteria
-if ! command -v hysteria &> /dev/null; then
-    echo -e "${YELLOW}[*] Hysteria 2 is not installed. Installing...${RESET}"
-    bash <(curl -fsSL https://get.hy2.sh/) &>/dev/null
-    if command -v hysteria &> /dev/null; then
-        echo -e "${GREEN}[+] Hysteria 2 installed successfully.${RESET}"
-    else
-        echo -e "${RED}[!] Failed to install Hysteria 2. Please check your internet connection.${RESET}"
-        exit 1
-    fi
-else
-    echo -e "${GREEN}[+] Hysteria 2 is already installed. Skipping installation.${RESET}"
-fi
-
-echo ""
+# ---------- منوی اصلی ----------
 echo "Select an option:"
-echo "1 - IRAN Server Configuration (Client/Forwarder)"
-echo "2 - FOREIGN Server Configuration (Server)"
-echo "3 - Uninstall Hysteria 2"
+echo "1 - IRAN Server Configuration"
+echo "2 - FOREIGN Server Configuration"
+echo "3 - Uninstall & Remove Tunnel"
 read -p "Enter your choice (1, 2 or 3): " LOCATION
 
 if [[ "$LOCATION" == "3" ]]; then
-    echo -e "${RED}[*] Uninstalling Hysteria 2...${RESET}"
-    systemctl stop hysteria-server hysteria-client 2>/dev/null
-    systemctl disable hysteria-server hysteria-client 2>/dev/null
-    rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-client.service
-    rm -rf /etc/hysteria
-    rm -f /usr/local/bin/hysteria
-    echo -e "${GREEN}[+] Hysteria 2 removed successfully!${RESET}"
+    echo -e "${RED}[*] Uninstalling and cleaning up...${RESET}"
+    systemctl stop awg-quick@awg0 2>/dev/null || true
+    systemctl disable awg-quick@awg0 2>/dev/null || true
+    ip link set awg0 down 2>/dev/null || true
+    ip link del awg0 2>/dev/null || true
+    rm -rf /etc/amnezia
+    rm -f /etc/systemd/system/awg-quick@awg0.service
+    iptables -F
+    iptables -X
+    iptables -t nat -F
+    iptables -t nat -X
+    iptables -t mangle -F
+    iptables -t mangle -X
+    iptables -P INPUT ACCEPT
+    iptables -P FORWARD ACCEPT
+    iptables -P OUTPUT ACCEPT
+    sysctl -w net.ipv4.ip_forward=0 >/dev/null
+    systemctl daemon-reload
+    echo -e "${GREEN}[+] Tunnel and all configurations removed successfully!${RESET}"
     exit 0
 fi
 
+read -p "Enter IRAN server IP: " IP_IRAN
+read -p "Enter FOREIGN server IP: " IP_FOREIGN
+read -p "Enter AmneziaWG Port (Default 51820): " AWG_PORT
+AWG_PORT=${AWG_PORT:-51820}
+
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
+[[ -z "$MAIN_INTERFACE" ]] && { echo -e "${RED}[!] Could not detect main interface${RESET}"; exit 1; }
 
-if [[ "$LOCATION" == "2" ]]; then
-    echo -e "${YELLOW}[*] Configuring FOREIGN Server...${RESET}"
-    
-    read -p "Enter Hysteria Port (Default 443): " HY_PORT
-    HY_PORT=${HY_PORT:-443}
-    
-    read -p "Enter a secure password for tunnel: " HY_PASSWORD
-    HY_PASSWORD=${HY_PASSWORD:-NetplasSecurePass2026}
+# حذف اینترفیس قبلی
+ip link del awg0 2>/dev/null || true
+mkdir -p /etc/amnezia/amneziawg
+chmod 700 /etc/amnezia /etc/amnezia/amneziawg
 
-    mkdir -p /etc/hysteria
+generate_random_params
 
-    # تولید گواهینامه SSL خودامضا
-    openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/hysteria/server.key -out /etc/hysteria/server.crt -days 3650 -subj "/CN=bing.com" 2>/dev/null
+if [[ "$LOCATION" == "1" ]]; then
+    # ==================== سرور ایران ====================
+    echo -e "${YELLOW}[*] Configuring IRAN server...${RESET}"
 
-    # ساخت فایل کانفیگ سرور خارج
-    cat << EOF > /etc/hysteria/config.yaml
-listen: :$HY_PORT
+    PrivKey=$(awg genkey)
+    PubKey=$(echo "$PrivKey" | awg pubkey)
+    echo "$PrivKey" > /etc/amnezia/amneziawg/private.key
+    chmod 600 /etc/amnezia/amneziawg/private.key
 
-tls:
-  cert: /etc/hysteria/server.crt
-  key: /etc/hysteria/server.key
+    echo -e "${YELLOW}[?] First run the FOREIGN server script and copy its Public Key.${RESET}"
+    read -p "Enter FOREIGN server Public Key: " FOREIGN_PUBKEY
 
-auth:
-  type: password
-  password: "$HY_PASSWORD"
+    # ساخت فایل کانفیگ دائمی
+    cat > /etc/amnezia/amneziawg/awg0.conf <<EOF
+[Interface]
+PrivateKey = $PrivKey
+Address = 10.0.0.2/30
+ListenPort = $AWG_PORT
+Jc = $JC
+Jmin = $JMIN
+Jmax = $JMAX
+S1 = $S1
+S2 = $S2
+H1 = $H1
+H2 = $H2
+H3 = $H3
+H4 = $H4
 
-masquerade:
-  type: proxy
-  proxy:
-    url: https://bing.com/
-    rewriteHost: true
+[Peer]
+PublicKey = $FOREIGN_PUBKEY
+Endpoint = $IP_FOREIGN:$AWG_PORT
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 35
 EOF
 
-    # تنظیم سرویس سیستمی برای سرور خارج
-    cat << EOF > /etc/systemd/system/hysteria-server.service
-[Unit]
-Description=Hysteria 2 Server
-After=network.target
+    chmod 600 /etc/amnezia/amneziawg/awg0.conf
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
-Restart=always
-User=root
+    # فعال‌سازی forwarding
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-amnezia.conf
 
-[Install]
-WantedBy=multi-user.target
-EOF
+    # بالا آوردن اینترفیس
+    awg-quick down awg0 2>/dev/null || true
+    awg-quick up awg0
 
-    systemctl daemon-reload
-    systemctl enable hysteria-server
-    systemctl restart hysteria-server
-
-    FOREIGN_IP=$(curl -s ifconfig.me)
-    echo -e "${GREEN}[+] Foreign Server configured successfully!${RESET}"
-    echo -e "Server IP: ${CYAN}$FOREIGN_IP${RESET}"
-    echo -e "Port: ${CYAN}$HY_PORT${RESET}"
-    echo -e "Password: ${CYAN}$HY_PASSWORD${RESET}"
-
-elif [[ "$LOCATION" == "1" ]]; then
-    echo -e "${YELLOW}[*] Configuring IRAN Server...${RESET}"
-
-    read -p "Enter FOREIGN Server IP: " IP_FOREIGN
-    read -p "Enter FOREIGN Server Port (Default 443): " HY_PORT
-    HY_PORT=${HY_PORT:-443}
-    read -p "Enter Tunnel Password (same as foreign): " HY_PASSWORD
-
-    mkdir -p /etc/hysteria
-
-    # ساخت فایل کانفیگ کلاینت در سرور ایران
-    cat << EOF > /etc/hysteria/config.yaml
-server: $IP_FOREIGN:$HY_PORT
-
-auth:
-  type: password
-  password: "$HY_PASSWORD"
-
-tls:
-  sni: bing.com
-  insecure: true
-
-udpFragment: true
-
-bandwidth:
-  up: 100 mbps
-  down: 100 mbps
-EOF
-
-    # تنظیم سرویس سیستمی برای سرور ایران
-    cat << EOF > /etc/systemd/system/hysteria-client.service
-[Unit]
-Description=Hysteria 2 Client Tunnel
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/hysteria client -c /etc/hysteria/config.yaml
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # فعال‌سازی فوروارد پورت‌ها از سرور ایران به سرور خارج با استفاده از iptables
-    sysctl -w net.ipv4.ip_forward=1 > /dev/null
+    # قوانین iptables
     iptables -t nat -F
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 127.0.0.1
-    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -m multiport ! --dports 53 -j DNAT --to-destination 127.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -j DNAT --to-destination 10.0.0.1
+    iptables -t nat -A POSTROUTING -o awg0 -j MASQUERADE
+    iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
+    iptables -A FORWARD -i awg0 -j ACCEPT
+    iptables -A FORWARD -o awg0 -j ACCEPT
+
+    save_iptables
+
+    # فعال‌سازی سرویس
+    systemctl enable awg-quick@awg0
+    systemctl daemon-reload
+
+    echo -e "${GREEN}[+] Iran server configured successfully!${RESET}"
+    echo -e "Iran Public Key: ${CYAN}$PubKey${RESET}"
+    echo -e "Obfuscation params used → Jc=$JC  Jmin=$JMIN  Jmax=$JMAX"
+
+elif [[ "$LOCATION" == "2" ]]; then
+    # ==================== سرور خارج ====================
+    echo -e "${YELLOW}[*] Configuring FOREIGN server...${RESET}"
+
+    PrivKey=$(awg genkey)
+    PubKey=$(echo "$PrivKey" | awg pubkey)
+    echo "$PrivKey" > /etc/amnezia/amneziawg/private.key
+    chmod 600 /etc/amnezia/amneziawg/private.key
+
+    echo -e "Your Foreign Server Public Key is: ${CYAN}$PubKey${RESET}"
+    read -p "Press Enter after you have saved this key..."
+
+    read -p "Enter IRAN server Public Key: " IRAN_PUBKEY
+
+    cat > /etc/amnezia/amneziawg/awg0.conf <<EOF
+[Interface]
+PrivateKey = $PrivKey
+Address = 10.0.0.1/30
+ListenPort = $AWG_PORT
+Jc = $JC
+Jmin = $JMIN
+Jmax = $JMAX
+S1 = $S1
+S2 = $S2
+H1 = $H1
+H2 = $H2
+H3 = $H3
+H4 = $H4
+
+[Peer]
+PublicKey = $IRAN_PUBKEY
+Endpoint = $IP_IRAN:$AWG_PORT
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 35
+EOF
+
+    chmod 600 /etc/amnezia/amneziawg/awg0.conf
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-amnezia.conf
+
+    awg-quick down awg0 2>/dev/null || true
+    awg-quick up awg0
+
+    iptables -A FORWARD -i awg0 -j ACCEPT
+    iptables -A FORWARD -o awg0 -j ACCEPT
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
-    systemctl daemon-reload
-    systemctl enable hysteria-client
-    systemctl restart hysteria-client
+    save_iptables
 
-    echo -e "${GREEN}[+] Iran Server configured successfully and traffic tunneled via Hysteria 2!${RESET}"
+    systemctl enable awg-quick@awg0
+    systemctl daemon-reload
+
+    echo -e "${GREEN}[+] Foreign server configured successfully!${RESET}"
+    echo -e "Obfuscation params used → Jc=$JC  Jmin=$JMIN  Jmax=$JMAX"
 
 else
     echo -e "${RED}[!] Invalid selection.${RESET}"
     exit 1
 fi
+
+echo -e "${GREEN}"
+echo "========================================"
+echo "  Configuration completed successfully"
+echo "  Tunnel will survive reboot"
+echo "========================================"
+echo -e "${RESET}"
