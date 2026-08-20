@@ -8,12 +8,12 @@ RESET=$(tput sgr0)
 
 echo -e "${CYAN}"
 echo "========================================"
-echo "   AmneziaWG Anti-Filter Tunnel v4.1"
-echo "   (Runtime - No Persistent Config)"
+echo "   AmneziaWG Anti-Filter Tunnel v4.2"
+echo "   (Random params - Shared manually)"
 echo "========================================"
 echo -e "${RESET}"
 
-# تولید پارامترهای تصادفی obfuscation
+# تولید پارامترهای تصادفی
 generate_random_params() {
     JC=$((3 + RANDOM % 5))
     JMIN=$((40 + RANDOM % 50))
@@ -26,7 +26,7 @@ generate_random_params() {
     H4=$((RANDOM * RANDOM + RANDOM))
 }
 
-# بررسی و نصب AmneziaWG
+# نصب در صورت نیاز
 if ! command -v awg &>/dev/null; then
     echo -e "${YELLOW}[*] Installing AmneziaWG...${RESET}"
     apt-get update -qq
@@ -36,7 +36,6 @@ if ! command -v awg &>/dev/null; then
     apt-get install -y amneziawg amneziawg-tools
 fi
 
-# منو
 echo "Select an option:"
 echo "1 - IRAN Server Configuration"
 echo "2 - FOREIGN Server Configuration"
@@ -68,12 +67,9 @@ AWG_PORT=${AWG_PORT:-51820}
 MAIN_INTERFACE=$(ip route show default | awk '/default/ {print $5}' | head -n1)
 [[ -z "$MAIN_INTERFACE" ]] && { echo -e "${RED}[!] Main interface not found${RESET}"; exit 1; }
 
-# حذف اینترفیس قبلی
 ip link del awg0 2>/dev/null || true
 mkdir -p /etc/amnezia/amneziawg
 chmod 700 /etc/amnezia /etc/amnezia/amneziawg
-
-generate_random_params
 
 if [[ "$LOCATION" == "1" ]]; then
     # ==================== سرور ایران ====================
@@ -84,8 +80,19 @@ if [[ "$LOCATION" == "1" ]]; then
     echo "$PrivKey" > /etc/amnezia/amneziawg/private.key
     chmod 600 /etc/amnezia/amneziawg/private.key
 
-    echo -e "${YELLOW}[?] First run FOREIGN server and copy its Public Key.${RESET}"
+    echo -e "${YELLOW}[?] First run FOREIGN server and copy its Public Key + Parameters.${RESET}"
     read -p "Enter FOREIGN server Public Key: " FOREIGN_PUBKEY
+
+    echo -e "${CYAN}Enter the SAME obfuscation parameters from FOREIGN server:${RESET}"
+    read -p "Jc: " JC
+    read -p "Jmin: " JMIN
+    read -p "Jmax: " JMAX
+    read -p "S1: " S1
+    read -p "S2: " S2
+    read -p "H1: " H1
+    read -p "H2: " H2
+    read -p "H3: " H3
+    read -p "H4: " H4
 
     sysctl -w net.ipv4.ip_forward=1 >/dev/null
 
@@ -101,7 +108,6 @@ if [[ "$LOCATION" == "1" ]]; then
 
     ip link set dev awg0 up
 
-    # قوانین NAT
     iptables -t nat -F
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p tcp -m multiport ! --dports 22,80,10052 -j DNAT --to-destination 10.0.0.1
     iptables -t nat -A PREROUTING -i $MAIN_INTERFACE -p udp -j DNAT --to-destination 10.0.0.1
@@ -112,19 +118,32 @@ if [[ "$LOCATION" == "1" ]]; then
 
     echo -e "${GREEN}[+] Iran server configured successfully!${RESET}"
     echo -e "Iran Public Key: ${CYAN}$PubKey${RESET}"
-    echo -e "Obfuscation → Jc=$JC Jmin=$JMIN Jmax=$JMAX"
 
 elif [[ "$LOCATION" == "2" ]]; then
     # ==================== سرور خارج ====================
     echo -e "${YELLOW}[*] Configuring FOREIGN server...${RESET}"
+
+    generate_random_params
 
     PrivKey=$(awg genkey)
     PubKey=$(echo "$PrivKey" | awg pubkey)
     echo "$PrivKey" > /etc/amnezia/amneziawg/private.key
     chmod 600 /etc/amnezia/amneziawg/private.key
 
+    echo -e "${GREEN}========================================${RESET}"
     echo -e "Foreign Public Key: ${CYAN}$PubKey${RESET}"
-    read -p "Press Enter after saving this key..."
+    echo -e "${YELLOW}Obfuscation Parameters (copy these to Iran server):${RESET}"
+    echo -e "Jc   = $JC"
+    echo -e "Jmin = $JMIN"
+    echo -e "Jmax = $JMAX"
+    echo -e "S1   = $S1"
+    echo -e "S2   = $S2"
+    echo -e "H1   = $H1"
+    echo -e "H2   = $H2"
+    echo -e "H3   = $H3"
+    echo -e "H4   = $H4"
+    echo -e "${GREEN}========================================${RESET}"
+    read -p "Press Enter after you saved the Public Key and Parameters..."
 
     read -p "Enter IRAN server Public Key: " IRAN_PUBKEY
 
@@ -147,7 +166,6 @@ elif [[ "$LOCATION" == "2" ]]; then
     iptables -t nat -A POSTROUTING -o $MAIN_INTERFACE -j MASQUERADE
 
     echo -e "${GREEN}[+] Foreign server configured successfully!${RESET}"
-    echo -e "Obfuscation → Jc=$JC Jmin=$JMIN Jmax=$JMAX"
 
 else
     echo -e "${RED}[!] Invalid option${RESET}"
@@ -156,6 +174,6 @@ fi
 
 echo -e "${GREEN}"
 echo "========================================"
-echo "  Done (Runtime mode - no persistent)"
+echo "  Done"
 echo "========================================"
 echo -e "${RESET}"
