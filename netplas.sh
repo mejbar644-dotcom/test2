@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================
 #  GitHub: Netplas
-#  Advanced Anti-DPI Tunnel v2.0 (Hysteria 2 + Salamander)
+#  Advanced Anti-DPI Tunnel v2.1 (Hysteria 2 + Salamander)
 #  - Optimized for Heavy Load & High Concurrency
-#  - Fully hardened against DPI & Traffic Analysis
+#  - Fixed TUN configuration schema for Hysteria v2
 # ============================================================
 
 set -uo pipefail
@@ -160,7 +160,8 @@ obfuscation:
 
 tun:
   name: ${IFACE}
-  address: ${IR_ADDR}/30
+  addresses:
+    - ${IR_ADDR}/30
   mtu: 1350
 EOF
 
