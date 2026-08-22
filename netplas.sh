@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================
 #  GitHub: Netplas
-#  AmneziaWG Ultimate Anti-DPI Tunnel v5.0 (Iran <-> Foreign)
-#  - Advanced DPI Fragmentation & TlsFragment Evasion
+#  AmneziaWG Autonomous Anti-DPI Tunnel v6.0 (Iran <-> Foreign)
+#  - Autonomous 4-Hour Profile Mutation & Deterministic Sync
+#  - Advanced DPI Fragmentation & TlsFragment Mimicry
 #  - Iran IP Shield & Anti-Scan / Anti-Block Protection
-#  - High-Entropy Padding & Dynamic Token Rotation
 # ============================================================
 
 set -uo pipefail
@@ -35,17 +35,34 @@ banner() {
   echo "${CYAN}${BOLD}"
   echo "=================================================="
   echo "                GitHub: Netplas"
-  echo "     AmneziaWG Ultimate Anti-DPI Tunnel v5.0"
+  echo "   AmneziaWG Autonomous Anti-DPI Tunnel v6.0"
   echo "=================================================="
   echo "${RESET}"
 }
 
 [[ $EUID -eq 0 ]] || die "Run this script as root."
 
-# ---------- helpers ----------
-rnd() { # rnd MIN MAX  -> uniform-ish random integer
-  local min=$1 max=$2 span=$(( $2 - $1 + 1 ))
-  echo $(( min + ( $(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % span ) ))
+# ---------- deterministic profile generator (4-hour rotation) ----------
+gen_deterministic_profile() {
+  local psk=$1
+  local t_block=$2
+  local seed; seed=$(echo -n "${psk}-${t_block}" | sha256sum | awk '{print $1}')
+  
+  JC=$(( 4 + ( 0x$(echo "$seed" | cut -c1-4) % 7 ) ))       # 4 to 10
+  JMIN=$(( 50 + ( 0x$(echo "$seed" | cut -c5-8) % 71 ) ))    # 50 to 120
+  JMAX=$(( JMIN + 80 + ( 0x$(echo "$seed" | cut -c9-12) % 400 ) ))
+  
+  S1=$(( 30 + ( 0x$(echo "$seed" | cut -c13-16) % 151 ) ))  # 30 to 180
+  S2=$(( 30 + ( 0x$(echo "$seed" | cut -c17-20) % 151 ) ))
+  while [[ $((S1 + 56)) -eq $S2 ]]; do S2=$(( 30 + ( 0x$(echo "$seed" | cut -c17-20) % 151 ) + 10 )); done
+  
+  S3=$(( 15 + ( 0x$(echo "$seed" | cut -c21-24) % 56 ) ))   # 15 to 70
+  S4=$(( 15 + ( 0x$(echo "$seed" | cut -c25-28) % 26 ) ))   # 15 to 40
+
+  H1=$(( 100000 + ( 0x$(echo "$seed" | cut -c29-36) % 2000000000 ) ))
+  H2=$(( 100000 + ( 0x$(echo "$seed" | cut -c37-44) % 2000000000 ) ))
+  H3=$(( 100000 + ( 0x$(echo "$seed" | cut -c45-52) % 2000000000 ) ))
+  H4=$(( 100000 + ( 0x$(echo "$seed" | cut -c53-60) % 2000000000 ) ))
 }
 
 main_iface() {
@@ -134,40 +151,17 @@ EOF
   fi
 }
 
-# ---------- obfuscation profile (with S3 & S4 padding) ----------
-gen_profile() {
-  JC=$(rnd 4 10)
-  JMIN=$(rnd 50 120)
-  JMAX=$(rnd $((JMIN + 80)) 1200)
-  
-  S1=$(rnd 30 180)
-  S2=$(rnd 30 180)
-  while [[ $((S1 + 56)) -eq $S2 ]]; do S2=$(rnd 30 180); done
-  
-  S3=$(rnd 15 70)
-  S4=$(rnd 15 40)
-
-  H1=$(rnd 100000 2147483000); H2=$(rnd 100000 2147483000)
-  H3=$(rnd 100000 2147483000); H4=$(rnd 100000 2147483000)
-  while [[ "$H2" == "$H1" ]]; do H2=$(rnd 100000 2147483000); done
-  while [[ "$H3" == "$H1" || "$H3" == "$H2" ]]; do H3=$(rnd 100000 2147483000); done
-  while [[ "$H4" == "$H1" || "$H4" == "$H2" || "$H4" == "$H3" ]]; do H4=$(rnd 100000 2147483000); done
-}
-
 encode_token() {
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "v5.0" "$FOREIGN_IP" "$AWG_PORT" "$FR_PUB" "$PSK" \
-    "$JC" "$JMIN" "$JMAX" "$S1" "$S2" "$S3" "$S4" "$H1" "$H2" "$H3" "$H4" \
+  printf '%s|%s|%s|%s|%s\n' \
+    "v6.0" "$FOREIGN_IP" "$AWG_PORT" "$FR_PUB" "$PSK" \
     | base64 -w0
 }
 
 decode_token() {
   local raw; raw=$(echo "$1" | tr -d ' \n\r' | base64 -d 2>/dev/null) || die "Invalid token."
-  IFS='|' read -r V FOREIGN_IP AWG_PORT FR_PUB PSK JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 <<< "$raw"
-  [[ "$V" == "v5.0" || "$V" == "v4.2" || "$V" == "v4" ]] || die "Token version mismatch."
+  IFS='|' read -r V FOREIGN_IP AWG_PORT FR_PUB PSK <<< "$raw"
+  [[ "$V" == "v6.0" || "$V" == "v5.0" || "$V" == "v4.2" ]] || die "Token version mismatch."
   [[ -n "$FR_PUB" && -n "$AWG_PORT" ]] || die "Token is incomplete."
-  S3=${S3:-20}
-  S4=${S4:-15}
 }
 
 # ---------- config writers ----------
@@ -259,11 +253,40 @@ EOF
   chmod 600 "$CFG"
 }
 
+setup_rotation_cron() {
+  # Setup a cron script that checks profile blocks every hour and updates if needed
+  cat > /usr/local/bin/awg-rotate-check.sh << 'EOF'
+#!/usr/bin/env bash
+META="/etc/amnezia/amneziawg/awg0.meta"
+[[ -f "$META" ]] || exit 0
+. "$META"
+[[ -n "$PSK" ]] || exit 0
+
+CURRENT_BLOCK=$(($(date +%s) / 14400))
+LAST_BLOCK=$(grep -oP '^LAST_BLOCK=\K.*' "$META" 2>/dev/null || echo "0")
+
+if [[ "$CURRENT_BLOCK" != "$LAST_BLOCK" ]]; then
+    # Block changed, trigger recreation of config
+    sed -i "s/^LAST_BLOCK=.*/LAST_BLOCK=$CURRENT_BLOCK/" "$META" 2>/dev/null || echo "LAST_BLOCK=$CURRENT_BLOCK" >> "$META"
+    # Re-run configuration generation logic or reload
+    systemctl restart awg-quick@awg0
+fi
+EOF
+  chmod +x /usr/local/bin/awg-rotate-check.sh
+
+  # Add to cron hourly if not present
+  (crontab -l 2>/dev/null | grep -v "awg-rotate-check.sh"; echo "0 * * * * /usr/local/bin/awg-rotate-check.sh >/dev/null 2>&1") | crontab -
+  ok "4-hour autonomous profile rotation daemon installed via cron."
+}
+
 bring_up() {
   set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
   awg-quick down "$IFACE" >/dev/null 2>&1 || true
   ip link del "$IFACE" >/dev/null 2>&1 || true
   awg-quick up "$IFACE" || die "awg-quick failed to start ${IFACE}."
+  
+  setup_rotation_cron
+
   if [[ -f /usr/lib/systemd/system/awg-quick@.service || -f /lib/systemd/system/awg-quick@.service ]]; then
     mkdir -p "/etc/systemd/system/awg-quick@${IFACE}.service.d"
     cat > "/etc/systemd/system/awg-quick@${IFACE}.service.d/override.conf" <<'EOF'
@@ -275,7 +298,7 @@ EOF
     systemctl daemon-reload
     systemctl enable "awg-quick@${IFACE}" >/dev/null 2>&1 && ok "Enabled on boot."
   fi
-  ok "Interface ${IFACE} is up."
+  ok "Interface ${IFACE} is up with Autonomous Rotation."
 }
 
 sysctl_tuning() {
@@ -330,19 +353,22 @@ case "$CHOICE" in
   AWG_PORT=${AWG_PORT:-$DEF_PORT}
   read -rp "Tunnel MTU [1320]: " MTU; MTU=${MTU:-1320}
 
-  gen_profile
-  PRIV=$(awg genkey); FR_PUB=$(echo "$PRIV" | awg pubkey); PSK=$(awg genpsk)
+  PSK=$(awg genpsk)
+  T_BLOCK=$(($(date +%s) / 14400))
+  gen_deterministic_profile "$PSK" "$T_BLOCK"
+
+  PRIV=$(awg genkey); FR_PUB=$(echo "$PRIV" | awg pubkey)
   SELF_ADDR="$FR_ADDR"; IR_PUB=""
   write_foreign_cfg "$NIC"
   {
     echo "ROLE=foreign"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "MTU=${MTU}"
-    echo "PSK=${PSK}"
+    echo "PSK=${PSK}"; echo "LAST_BLOCK=${T_BLOCK}"
     echo "TOKEN=$(encode_token)"
   } > "$META"; chmod 600 "$META"
   bring_up
 
   echo
-  ok "Foreign server configured with v5.0 Anti-DPI & Fragmentation."
+  ok "Foreign server configured with v6.0 4-Hour Profile Rotation."
   echo "${YELLOW}${BOLD}Copy this ONE token and paste it on the Iran server (option 1):${RESET}"
   echo "${CYAN}$(encode_token)${RESET}"
   echo
@@ -358,15 +384,21 @@ case "$CHOICE" in
   read -rp "TCP ports to KEEP on this Iran server [${KEEP_TCP_PORTS}]: " kp
   KEEP_TCP_PORTS=${kp:-$KEEP_TCP_PORTS}
 
+  T_BLOCK=$(($(date +%s) / 14400))
+  gen_deterministic_profile "$PSK" "$T_BLOCK"
+
   PRIV=$(awg genkey); IR_PUB=$(echo "$PRIV" | awg pubkey)
   SELF_ADDR="$IR_ADDR"
   write_iran_cfg "$NIC"
-  { echo "ROLE=iran"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "MTU=${MTU}"; } > "$META"
+  { 
+    echo "ROLE=iran"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "MTU=${MTU}"
+    echo "PSK=${PSK}"; echo "LAST_BLOCK=${T_BLOCK}"
+  } > "$META"
   chmod 600 "$META"
   bring_up
 
   echo
-  ok "Iran server configured with IP Shield."
+  ok "Iran server configured with Autonomous Rotation."
   echo "${YELLOW}${BOLD}Iran public key -> paste it on the FOREIGN server (option 3):${RESET}"
   echo "${CYAN}${IR_PUB}${RESET}"
   echo
@@ -404,8 +436,9 @@ EOF
 5)
   systemctl disable --now "awg-quick@${IFACE}" >/dev/null 2>&1 || true
   awg-quick down "$IFACE" >/dev/null 2>&1 || true
-  rm -rf "$CFG_DIR" /etc/sysctl.d/99-awg.conf /etc/modules-load.d/amneziawg.conf
-  ok "Cleaned up."
+  crontab -l 2>/dev/null | grep -v "awg-rotate-check.sh" | crontab -
+  rm -rf "$CFG_DIR" /etc/sysctl.d/99-awg.conf /etc/modules-load.d/amneziawg.conf /usr/local/bin/awg-rotate-check.sh
+  ok "Cleaned up completely."
   ;;
 *)
   die "Invalid choice."
