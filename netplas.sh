@@ -1,675 +1,413 @@
 #!/usr/bin/env bash
 # ============================================================
-# Cloak / ShadowTLS + Shadowsocks Gateway
-# Iran <-> Foreign
-#
-# Modes:
-#   1. cloak      : Shadowsocks over Cloak
-#   2. shadowtls  : Shadowsocks over ShadowTLS v3
-#
-# Client-side optional:
-#   3. TlsFragment source installer
-#
-# Important:
-# - Only ONE transport mode is active at a time.
-# - TlsFragment is a client-side component, not a gateway daemon.
-# - Rotation of password/port requires a fresh token on both sides.
+#  GitHub: Netplas
+#  AmneziaWG Ultimate Anti-DPI Tunnel v5.0 (Iran <-> Foreign)
+#  - Advanced DPI Fragmentation & TlsFragment Evasion
+#  - Iran IP Shield & Anti-Scan / Anti-Block Protection
+#  - High-Entropy Padding & Dynamic Token Rotation
 # ============================================================
 
-set -euo pipefail
+set -uo pipefail
 
-BASE_DIR="/etc/stealth-gateway"
-CFG_DIR="${BASE_DIR}/config"
-META="${BASE_DIR}/gateway.meta"
-STATE_DIR="${BASE_DIR}/state"
+IFACE="awg0"
+CFG_DIR="/etc/amnezia/amneziawg"
+CFG="${CFG_DIR}/${IFACE}.conf"
+META="${CFG_DIR}/${IFACE}.meta"
+IR_ADDR="10.0.0.2"
+FR_ADDR="10.0.0.1"
+CIDR="30"
+KEEP_TCP_PORTS="22,80,443,10052"   # ports that must stay on the Iran server
 
-SS_SERVER_CFG="${CFG_DIR}/ss-server.json"
-SS_REDIR_CFG="${CFG_DIR}/ss-redir.json"
-
-CLOAK_SERVER_CFG="${CFG_DIR}/ckserver.json"
-CLOAK_CLIENT_CFG="${CFG_DIR}/ckclient.json"
-
-LOCAL_SS_PORT="8388"
-LOCAL_REDIR_PORT="1080"
-LOCAL_CLOAK_PORT="1984"
-LOCAL_SHADOWTLS_PORT="1985"
-
-KEEP_TCP_PORTS="22,80,443,10052"
-DEFAULT_METHOD="chacha20-ietf-poly1305"
-
-if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then
-  CYAN=$(tput setaf 6 || true)
-  GREEN=$(tput setaf 2 || true)
-  YELLOW=$(tput setaf 3 || true)
-  RED=$(tput setaf 1 || true)
-  BOLD=$(tput bold || true)
-  RESET=$(tput sgr0 || true)
+# ---------- colors (safe when TERM is unset) ----------
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && tput setaf 1 >/dev/null 2>&1; then
+  CYAN=$(tput setaf 6); YELLOW=$(tput setaf 3); GREEN=$(tput setaf 2)
+  RED=$(tput setaf 1); BOLD=$(tput bold); RESET=$(tput sgr0)
 else
-  CYAN=""; GREEN=""; YELLOW=""; RED=""; BOLD=""; RESET=""
+  CYAN=""; YELLOW=""; GREEN=""; RED=""; BOLD=""; RESET=""
 fi
-
-info() { echo "${CYAN}[*]${RESET} $*"; }
-ok() { echo "${GREEN}[+]${RESET} $*"; }
-warn() { echo "${YELLOW}[!]${RESET} $*"; }
-err() { echo "${RED}[x]${RESET} $*" >&2; }
-die() { err "$*"; exit 1; }
+info()  { echo "${CYAN}[*]${RESET} $*"; }
+ok()    { echo "${GREEN}[+]${RESET} $*"; }
+warn()  { echo "${YELLOW}[!]${RESET} $*"; }
+err()   { echo "${RED}[x]${RESET} $*" >&2; }
+die()   { err "$*"; exit 1; }
 
 banner() {
   echo "${CYAN}${BOLD}"
-  echo "================================================"
-  echo " Cloak / ShadowTLS + Shadowsocks Gateway v2.0 "
-  echo "                Iran <-> Foreign                "
-  echo "================================================"
+  echo "=================================================="
+  echo "                GitHub: Netplas"
+  echo "     AmneziaWG Ultimate Anti-DPI Tunnel v5.0"
+  echo "=================================================="
   echo "${RESET}"
 }
 
-[[ "${EUID}" -eq 0 ]] || die "Run this script as root."
+[[ $EUID -eq 0 ]] || die "Run this script as root."
 
-rnd() {
-  local min="$1" max="$2" span=$((max - min + 1))
-  echo $((min + ($(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % span)))
-}
-
-random_b64() {
-  head -c "$1" /dev/urandom | base64 -w0
+# ---------- helpers ----------
+rnd() { # rnd MIN MAX  -> uniform-ish random integer
+  local min=$1 max=$2 span=$(( $2 - $1 + 1 ))
+  echo $(( min + ( $(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % span ) ))
 }
 
 main_iface() {
-  ip -4 route show default 2>/dev/null \
-    | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+  ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
 }
 
-public_ip() {
-  curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true
+pub_ip() { curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true; }
+
+# ---------- install ----------
+detect_os() {
+  . /etc/os-release 2>/dev/null || true
+  OS_ID="${ID:-unknown}"; OS_LIKE="${ID_LIKE:-}"; OS_CODENAME="${VERSION_CODENAME:-}"
 }
 
-valid_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
-}
-
-valid_port_list() {
-  [[ "$1" =~ ^[0-9]{1,5}(,[0-9]{1,5})*$ ]] || return 1
-
-  local port
-  IFS=',' read -r -a ports <<< "$1"
-
-  for port in "${ports[@]}"; do
-    ((port >= 1 && port <= 65535)) || return 1
-  done
-}
-
-prepare_dirs() {
-  install -d -m 700 "$BASE_DIR" "$CFG_DIR" "$STATE_DIR"
-}
-
-install_dependencies() {
+install_tools() {
+  detect_os
+  info "Installing prerequisites & Anti-DPI tools..."
   export DEBIAN_FRONTEND=noninteractive
-
-  info "Installing dependencies..."
-
   apt-get update -qq
-  apt-get install -y -qq \
-    ca-certificates \
-    curl \
-    wget \
-    git \
-    jq \
-    iproute2 \
-    iptables \
-    shadowsocks-libev \
-    build-essential \
-    golang-go \
-    cargo \
-    rustc \
-    pkg-config \
-    libssl-dev \
-    libffi-dev \
-    python3 \
-    python3-pip \
-    zlib1g-dev >/dev/null
+  apt-get install -y -qq curl wget git iptables iproute2 openresolv \
+      software-properties-common ca-certificates build-essential \
+      "linux-headers-$(uname -r)" >/dev/null 2>&1 || \
+  apt-get install -y -qq curl wget git iptables iproute2 \
+      software-properties-common ca-certificates build-essential >/dev/null 2>&1
 
-  command -v ss-server >/dev/null 2>&1 \
-    || die "shadowsocks-libev installation failed."
-
-  command -v ss-redir >/dev/null 2>&1 \
-    || die "ss-redir installation failed."
-}
-
-install_cloak() {
-  if command -v ck-server >/dev/null 2>&1 \
-    && command -v ck-client >/dev/null 2>&1; then
-    ok "Cloak is already installed."
-    return 0
+  if [[ "$OS_ID" == "ubuntu" ]]; then
+    add-apt-repository -y ppa:amnezia/ppa >/dev/null 2>&1 || true
+    apt-get update -qq
+    apt-get install -y -qq amneziawg amneziawg-tools >/dev/null 2>&1 || true
   fi
 
-  info "Building Cloak..."
-
-  rm -rf /tmp/Cloak
-  git clone --depth 1 https://github.com/cbeuw/Cloak /tmp/Cloak >/dev/null 2>&1 \
-    || die "Cannot clone Cloak source."
-
-  (
-    cd /tmp/Cloak
-    go build -o ck-server ./cmd/ck-server
-    go build -o ck-client ./cmd/ck-client
-  ) >/dev/null 2>&1 || die "Cloak build failed."
-
-  install -m 0755 /tmp/Cloak/ck-server /usr/local/bin/ck-server
-  install -m 0755 /tmp/Cloak/ck-client /usr/local/bin/ck-client
-
-  command -v ck-server >/dev/null 2>&1 \
-    || die "ck-server installation failed."
-
-  command -v ck-client >/dev/null 2>&1 \
-    || die "ck-client installation failed."
-
-  ok "Cloak installed."
-}
-
-install_shadowtls() {
-  if command -v shadow-tls >/dev/null 2>&1; then
-    ok "ShadowTLS is already installed."
-    return 0
+  if ! command -v awg >/dev/null 2>&1; then
+    warn "Package not available; building amneziawg-tools from source..."
+    rm -rf /tmp/awg-tools
+    git clone -q --depth 1 https://github.com/amnezia-vpn/amneziawg-tools /tmp/awg-tools \
+      || die "Cannot fetch amneziawg-tools."
+    make -s -C /tmp/awg-tools/src -j"$(nproc)" >/dev/null \
+      && make -s -C /tmp/awg-tools/src install >/dev/null \
+      || die "Build of amneziawg-tools failed."
   fi
-
-  info "Installing ShadowTLS..."
-
-  cargo install shadow-tls --root /usr/local >/dev/null 2>&1 \
-    || die "ShadowTLS installation failed."
-
-  ln -sf /usr/local/bin/shadow-tls /usr/bin/shadow-tls
-
-  command -v shadow-tls >/dev/null 2>&1 \
-    || die "shadow-tls binary not found."
-
-  ok "ShadowTLS installed."
+  command -v awg >/dev/null 2>&1 || die "'awg' still not found."
+  ok "amneziawg-tools ready ($(command -v awg))."
 }
 
-write_sysctl() {
-  cat > /etc/sysctl.d/99-stealth-gateway.conf <<'EOF'
+kernel_ok() {
+  modprobe amneziawg >/dev/null 2>&1
+  ip link add dev awgtest type amneziawg >/dev/null 2>&1 || return 1
+  ip link del awgtest >/dev/null 2>&1
+  return 0
+}
+
+install_userspace() {
+  command -v amneziawg-go >/dev/null 2>&1 && { ok "amneziawg-go already installed."; return 0; }
+  warn "Kernel module unavailable. Installing amneziawg-go..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y -qq golang-go >/dev/null 2>&1 || apt-get install -y -qq golang >/dev/null 2>&1
+  command -v go >/dev/null 2>&1 || die "Go toolchain not available."
+  rm -rf /tmp/awg-go
+  git clone -q --depth 1 https://github.com/amnezia-vpn/amneziawg-go /tmp/awg-go \
+    || die "Cannot fetch amneziawg-go."
+  ( cd /tmp/awg-go && go build -o /usr/local/bin/amneziawg-go . ) >/dev/null 2>&1 \
+    || die "Build of amneziawg-go failed."
+  chmod +x /usr/local/bin/amneziawg-go
+  [[ -e /dev/net/tun ]] || { mkdir -p /dev/net; mknod /dev/net/tun c 10 200 2>/dev/null; chmod 600 /dev/net/tun; }
+  ok "amneziawg-go installed."
+}
+
+setup_backend() {
+  if kernel_ok; then
+    ok "Kernel module 'amneziawg' works."
+    echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
+    USERSPACE=0
+  else
+    install_userspace
+    USERSPACE=1
+  fi
+  mkdir -p /etc/default
+  if [[ $USERSPACE -eq 1 ]]; then
+    cat > /etc/default/amneziawg <<'EOF'
+WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
+AWG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
+WG_SUDO=1
+EOF
+  else
+    : > /etc/default/amneziawg
+  fi
+}
+
+# ---------- obfuscation profile (with S3 & S4 padding) ----------
+gen_profile() {
+  JC=$(rnd 4 10)
+  JMIN=$(rnd 50 120)
+  JMAX=$(rnd $((JMIN + 80)) 1200)
+  
+  S1=$(rnd 30 180)
+  S2=$(rnd 30 180)
+  while [[ $((S1 + 56)) -eq $S2 ]]; do S2=$(rnd 30 180); done
+  
+  S3=$(rnd 15 70)
+  S4=$(rnd 15 40)
+
+  H1=$(rnd 100000 2147483000); H2=$(rnd 100000 2147483000)
+  H3=$(rnd 100000 2147483000); H4=$(rnd 100000 2147483000)
+  while [[ "$H2" == "$H1" ]]; do H2=$(rnd 100000 2147483000); done
+  while [[ "$H3" == "$H1" || "$H3" == "$H2" ]]; do H3=$(rnd 100000 2147483000); done
+  while [[ "$H4" == "$H1" || "$H4" == "$H2" || "$H4" == "$H3" ]]; do H4=$(rnd 100000 2147483000); done
+}
+
+encode_token() {
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "v5.0" "$FOREIGN_IP" "$AWG_PORT" "$FR_PUB" "$PSK" \
+    "$JC" "$JMIN" "$JMAX" "$S1" "$S2" "$S3" "$S4" "$H1" "$H2" "$H3" "$H4" \
+    | base64 -w0
+}
+
+decode_token() {
+  local raw; raw=$(echo "$1" | tr -d ' \n\r' | base64 -d 2>/dev/null) || die "Invalid token."
+  IFS='|' read -r V FOREIGN_IP AWG_PORT FR_PUB PSK JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 <<< "$raw"
+  [[ "$V" == "v5.0" || "$V" == "v4.2" || "$V" == "v4" ]] || die "Token version mismatch."
+  [[ -n "$FR_PUB" && -n "$AWG_PORT" ]] || die "Token is incomplete."
+  S3=${S3:-20}
+  S4=${S4:-15}
+}
+
+# ---------- config writers ----------
+common_iface_block() {
+  cat <<EOF
+[Interface]
+PrivateKey = ${PRIV}
+Address = ${SELF_ADDR}/${CIDR}
+ListenPort = ${AWG_PORT}
+MTU = ${MTU}
+Jc = ${JC}
+Jmin = ${JMIN}
+Jmax = ${JMAX}
+S1 = ${S1}
+S2 = ${S2}
+S3 = ${S3}
+S4 = ${S4}
+H1 = ${H1}
+H2 = ${H2}
+H3 = ${H3}
+H4 = ${H4}
+EOF
+}
+
+write_iran_cfg() {
+  local NIC=$1
+  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
+  { common_iface_block
+    cat <<EOF
+PostUp = sysctl -qw net.ipv4.ip_forward=1
+PostUp = iptables -t nat -N AWG_DNAT 2>/dev/null || true
+PostUp = iptables -t nat -F AWG_DNAT
+PostUp = iptables -t nat -C PREROUTING -i ${NIC} -j AWG_DNAT 2>/dev/null || iptables -t nat -I PREROUTING 1 -i ${NIC} -j AWG_DNAT
+PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport ! --dports ${KEEP_TCP_PORTS} -j DNAT --to-destination ${FR_ADDR}
+PostUp = iptables -t nat -A AWG_DNAT -p udp -m multiport ! --dports ${AWG_PORT} -j DNAT --to-destination ${FR_ADDR}
+PostUp = iptables -t nat -C POSTROUTING -o %i -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o %i -j MASQUERADE
+PostUp = iptables -C FORWARD -i ${NIC} -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i ${NIC} -o %i -j ACCEPT
+PostUp = iptables -C FORWARD -i %i -o ${NIC} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i %i -o ${NIC} -j ACCEPT
+PostUp = iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostUp = iptables -t mangle -A FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
+PostDown = iptables -t nat -D PREROUTING -i ${NIC} -j AWG_DNAT 2>/dev/null || true
+PostDown = iptables -t nat -F AWG_DNAT 2>/dev/null || true
+PostDown = iptables -t nat -X AWG_DNAT 2>/dev/null || true
+PostDown = iptables -t nat -D POSTROUTING -o %i -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -D FORWARD -i ${NIC} -o %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -i %i -o ${NIC} -j ACCEPT 2>/dev/null || true
+PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+PostDown = iptables -t mangle -D FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300 2>/dev/null || true
+
+[Peer]
+PublicKey = ${FR_PUB}
+PresharedKey = ${PSK}
+AllowedIPs = ${FR_ADDR}/32
+Endpoint = ${FOREIGN_IP}:${AWG_PORT}
+PersistentKeepalive = 25
+EOF
+  } > "$CFG"
+  chmod 600 "$CFG"
+}
+
+write_foreign_cfg() {
+  local NIC=$1
+  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
+  { common_iface_block
+    cat <<EOF
+PostUp = sysctl -qw net.ipv4.ip_forward=1
+PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i %i -j ACCEPT
+PostUp = iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o %i -j ACCEPT
+PostUp = iptables -t nat -C POSTROUTING -s ${IR_ADDR}/32 -o ${NIC} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${IR_ADDR}/32 -o ${NIC} -j MASQUERADE
+PostUp = iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostUp = iptables -t mangle -A FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
+PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -t nat -D POSTROUTING -s ${IR_ADDR}/32 -o ${NIC} -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+PostDown = iptables -t mangle -D FORWARD -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300 2>/dev/null || true
+EOF
+    if [[ -n "${IR_PUB:-}" ]]; then
+      cat <<EOF
+
+[Peer]
+PublicKey = ${IR_PUB}
+PresharedKey = ${PSK}
+AllowedIPs = ${IR_ADDR}/32
+PersistentKeepalive = 25
+EOF
+    fi
+  } > "$CFG"
+  chmod 600 "$CFG"
+}
+
+bring_up() {
+  set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
+  awg-quick down "$IFACE" >/dev/null 2>&1 || true
+  ip link del "$IFACE" >/dev/null 2>&1 || true
+  awg-quick up "$IFACE" || die "awg-quick failed to start ${IFACE}."
+  if [[ -f /usr/lib/systemd/system/awg-quick@.service || -f /lib/systemd/system/awg-quick@.service ]]; then
+    mkdir -p "/etc/systemd/system/awg-quick@${IFACE}.service.d"
+    cat > "/etc/systemd/system/awg-quick@${IFACE}.service.d/override.conf" <<'EOF'
+[Service]
+EnvironmentFile=-/etc/default/amneziawg
+Restart=on-failure
+RestartSec=5
+EOF
+    systemctl daemon-reload
+    systemctl enable "awg-quick@${IFACE}" >/dev/null 2>&1 && ok "Enabled on boot."
+  fi
+  ok "Interface ${IFACE} is up."
+}
+
+sysctl_tuning() {
+  cat > /etc/sysctl.d/99-awg.conf <<'EOF'
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=2
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_fin_timeout=15
 EOF
-
-  sysctl --system >/dev/null 2>&1 || true
+  sysctl -q --system >/dev/null 2>&1 || true
 }
 
-disable_transports() {
-  systemctl disable --now \
-    cloak-server.service \
-    cloak-client.service \
-    shadowtls-server.service \
-    shadowtls-client.service \
-    >/dev/null 2>&1 || true
-}
-
-write_ss_server() {
-  cat > "$SS_SERVER_CFG" <<EOF
-{
-  "server": "127.0.0.1",
-  "server_port": ${LOCAL_SS_PORT},
-  "password": "${SS_PASSWORD}",
-  "timeout": 300,
-  "method": "${SS_METHOD}",
-  "mode": "tcp_only"
-}
-EOF
-
-  chmod 600 "$SS_SERVER_CFG"
-
-  cat > /etc/systemd/system/stealth-ss-server.service <<EOF
-[Unit]
-Description=Shadowsocks Server for Stealth Gateway
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/ss-server -c ${SS_SERVER_CFG}
-Restart=always
-RestartSec=4
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-write_ss_redir() {
-  local upstream_port="$1"
-
-  cat > "$SS_REDIR_CFG" <<EOF
-{
-  "server": "127.0.0.1",
-  "server_port": ${upstream_port},
-  "local_address": "0.0.0.0",
-  "local_port": ${LOCAL_REDIR_PORT},
-  "password": "${SS_PASSWORD}",
-  "timeout": 300,
-  "method": "${SS_METHOD}",
-  "mode": "tcp_only"
-}
-EOF
-
-  chmod 600 "$SS_REDIR_CFG"
-
-  cat > /etc/systemd/system/stealth-ss-redir.service <<EOF
-[Unit]
-Description=Shadowsocks Transparent Redirector
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/ss-redir -c ${SS_REDIR_CFG}
-Restart=always
-RestartSec=4
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-write_cloak_foreign() {
-  local key_output
-
-  key_output=$(ck-server -key)
-  CLOAK_PRIVATE_KEY=$(echo "$key_output" | awk -F': ' '/PrivateKey/{print $2; exit}')
-  CLOAK_PUBLIC_KEY=$(echo "$key_output" | awk -F': ' '/PublicKey/{print $2; exit}')
-  CLOAK_UID=$(ck-server -uid | tail -n1 | tr -d '[:space:]')
-
-  [[ -n "$CLOAK_PRIVATE_KEY" ]] || die "Cannot create Cloak private key."
-  [[ -n "$CLOAK_PUBLIC_KEY" ]] || die "Cannot create Cloak public key."
-  [[ -n "$CLOAK_UID" ]] || die "Cannot create Cloak UID."
-
-  cat > "$CLOAK_SERVER_CFG" <<EOF
-{
-  "ProxyBook": {
-    "shadowsocks": ["tcp", "127.0.0.1:${LOCAL_SS_PORT}"]
-  },
-  "BindAddr": [":${TRANSPORT_PORT}"],
-  "BypassUID": ["${CLOAK_UID}"],
-  "RedirAddr": "${DECOY_HOST}:443",
-  "PrivateKey": "${CLOAK_PRIVATE_KEY}",
-  "AdminUID": "${CLOAK_UID}",
-  "DatabasePath": "${STATE_DIR}/cloak-users.db",
-  "StreamTimeout": 300
-}
-EOF
-
-  chmod 600 "$CLOAK_SERVER_CFG"
-
-  cat > /etc/systemd/system/cloak-server.service <<EOF
-[Unit]
-Description=Cloak Server
-After=network-online.target stealth-ss-server.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/ck-server -c ${CLOAK_SERVER_CFG}
-Restart=always
-RestartSec=4
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-write_cloak_iran() {
-  cat > "$CLOAK_CLIENT_CFG" <<EOF
-{
-  "Transport": "direct",
-  "ProxyMethod": "shadowsocks",
-  "EncryptionMethod": "plain",
-  "UID": "${CLOAK_UID}",
-  "PublicKey": "${CLOAK_PUBLIC_KEY}",
-  "ServerName": "${DECOY_HOST}",
-  "NumConn": 4,
-  "BrowserSig": "chrome",
-  "StreamTimeout": 300,
-  "LocalHost": "127.0.0.1",
-  "LocalPort": ${LOCAL_CLOAK_PORT},
-  "RemotePort": ${TRANSPORT_PORT}
-}
-EOF
-
-  chmod 600 "$CLOAK_CLIENT_CFG"
-
-  cat > /etc/systemd/system/cloak-client.service <<EOF
-[Unit]
-Description=Cloak Client
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=-${META}
-ExecStart=/usr/local/bin/ck-client -c ${CLOAK_CLIENT_CFG} -s \${FOREIGN_IP}
-Restart=always
-RestartSec=4
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-write_shadowtls_foreign() {
-  cat > /etc/systemd/system/shadowtls-server.service <<EOF
-[Unit]
-Description=ShadowTLS v3 Server
-After=network-online.target stealth-ss-server.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-Environment=RUST_LOG=error
-Environment=MONOIO_FORCE_LEGACY_DRIVER=1
-ExecStart=/usr/bin/shadow-tls --v3 server \\
-  --listen 0.0.0.0:${TRANSPORT_PORT} \\
-  --server 127.0.0.1:${LOCAL_SS_PORT} \\
-  --tls "${SNI_LIST}" \\
-  --password "${SHADOWTLS_PASSWORD}"
-Restart=always
-RestartSec=4
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-choose_sni() {
-  local entries=()
-  IFS=';' read -r -a entries <<< "$SNI_LIST"
-  (( ${#entries[@]} > 0 )) || die "SNI list is empty."
-  echo "${entries[$((RANDOM % ${#entries[@]}))]}"
-}
-
-write_shadowtls_iran() {
-  ACTIVE_SNI=$(choose_sni)
-
-  printf '%s\n' "$ACTIVE_SNI" > "${STATE_DIR}/active-sni"
-  chmod 600 "${STATE_DIR}/active-sni"
-
-  cat > /etc/systemd/system/shadowtls-client.service <<EOF
-[Unit]
-Description=ShadowTLS v3 Client
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-EnvironmentFile=-${META}
-Environment=RUST_LOG=error
-Environment=MONOIO_FORCE_LEGACY_DRIVER=1
-ExecStart=/usr/bin/shadow-tls --v3 client \\
-  --listen 127.0.0.1:${LOCAL_SHADOWTLS_PORT} \\
-  --server \${FOREIGN_IP}:${TRANSPORT_PORT} \\
-  --sni "${ACTIVE_SNI}" \\
-  --password "${SHADOWTLS_PASSWORD}"
-Restart=always
-RestartSec=4
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-write_rotation_tools() {
-  cat > /usr/local/sbin/stealth-rotate-sni <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-META="/etc/stealth-gateway/gateway.meta"
-STATE="/etc/stealth-gateway/state/active-sni"
-
-[[ -f "$META" ]] || exit 0
-. "$META"
-
-[[ "${MODE:-}" == "shadowtls" ]] || exit 0
-[[ -n "${SNI_LIST:-}" ]] || exit 0
-
-IFS=';' read -r -a SNIS <<< "$SNI_LIST"
-(( ${#SNIS[@]} > 0 )) || exit 0
-
-NEW_SNI="${SNIS[$((RANDOM % ${#SNIS[@]}))]}"
-printf '%s\n' "$NEW_SNI" > "$STATE"
-chmod 600 "$STATE"
-
-sed -i \
-  -E "s/(--sni \")[^\"]+/\1${NEW_SNI}/" \
-  /etc/systemd/system/shadowtls-client.service
-
-systemctl daemon-reload
-systemctl restart shadowtls-client.service
-EOF
-
-  chmod 700 /usr/local/sbin/stealth-rotate-sni
-
-  cat > /etc/systemd/system/stealth-rotate-sni.service <<'EOF'
-[Unit]
-Description=Rotate ShadowTLS SNI
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/stealth-rotate-sni
-EOF
-
-  cat > /etc/systemd/system/stealth-rotate-sni.timer <<'EOF'
-[Unit]
-Description=Periodic ShadowTLS SNI rotation
-
-[Timer]
-OnBootSec=20min
-OnUnitActiveSec=24h
-RandomizedDelaySec=6h
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now stealth-rotate-sni.timer >/dev/null 2>&1 || true
-}
-
-enable_transparent_redirect() {
-  local nic="$1"
-  local port_list="$2"
-
-  iptables -t nat -N STEALTH_REDIR 2>/dev/null || true
-  iptables -t nat -F STEALTH_REDIR
-
-  iptables -t nat -C PREROUTING -i "$nic" -p tcp -j STEALTH_REDIR 2>/dev/null \
-    || iptables -t nat -I PREROUTING 1 -i "$nic" -p tcp -j STEALTH_REDIR
-
-  IFS=',' read -r -a ports <<< "$port_list"
-
-  local port
-  for port in "${ports[@]}"; do
-    iptables -t nat -A STEALTH_REDIR -p tcp --dport "$port" -j RETURN
+wait_handshake() {
+  info "Waiting for handshake (up to 25s)..."
+  for _ in $(seq 1 25); do
+    if awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{if ($2+0 > 0) found=1} END{exit !found}'; then
+      ok "Handshake established."
+      return 0
+    fi
+    sleep 1
   done
-
-  iptables -t nat -A STEALTH_REDIR \
-    -p tcp \
-    -m addrtype ! --dst-type LOCAL \
-    -j REDIRECT --to-ports "$LOCAL_REDIR_PORT"
+  warn "No handshake yet. Check provider firewall for UDP port ${AWG_PORT}."
+  return 1
 }
 
-disable_transparent_redirect() {
-  local nic="${1:-}"
+# ============================ MENU ============================
+banner
+cat <<EOF
+Select an option:
+  1 - IRAN server      (run this AFTER the foreign server)
+  2 - FOREIGN server   (run this FIRST)
+  3 - FOREIGN: add / update the Iran peer key
+  4 - Diagnostics
+  5 - Uninstall & clean up
+EOF
+read -rp "Enter your choice: " CHOICE
 
-  [[ -n "$nic" ]] && \
-    iptables -t nat -D PREROUTING -i "$nic" -p tcp -j STEALTH_REDIR 2>/dev/null || true
-
-  iptables -t nat -F STEALTH_REDIR 2>/dev/null || true
-  iptables -t nat -X STEALTH_REDIR 2>/dev/null || true
-}
-
-encode_token() {
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
-    "stealth-v2" \
-    "$MODE" \
-    "$FOREIGN_IP" \
-    "$TRANSPORT_PORT" \
-    "$SS_PASSWORD" \
-    "$SS_METHOD" \
-    "$DECOY_HOST" \
-    "$CLOAK_UID" \
-    "$CLOAK_PUBLIC_KEY" \
-    "$SHADOWTLS_PASSWORD" \
-    "$SNI_LIST" \
-    | base64 -w0
-}
-
-decode_token() {
-  local raw
-
-  raw=$(echo "$1" | tr -d ' \r\n' | base64 -d 2>/dev/null) \
-    || die "Invalid token."
-
-  IFS='|' read -r \
-    TOKEN_VERSION \
-    MODE \
-    FOREIGN_IP \
-    TRANSPORT_PORT \
-    SS_PASSWORD \
-    SS_METHOD \
-    DECOY_HOST \
-    CLOAK_UID \
-    CLOAK_PUBLIC_KEY \
-    SHADOWTLS_PASSWORD \
-    SNI_LIST <<< "$raw"
-
-  [[ "$TOKEN_VERSION" == "stealth-v2" ]] \
-    || die "Token version mismatch."
-
-  [[ "$MODE" == "cloak" || "$MODE" == "shadowtls" ]] \
-    || die "Invalid transport mode."
-
-  valid_port "$TRANSPORT_PORT" \
-    || die "Invalid transport port."
-
-  [[ -n "$SS_PASSWORD" && -n "$FOREIGN_IP" ]] \
-    || die "Token is incomplete."
-}
-
-setup_foreign() {
-  install_dependencies
-  prepare_dirs
-  write_sysctl
-  disable_transports
-
-  FOREIGN_IP=$(public_ip)
-
-  read -rp "Foreign public IP [${FOREIGN_IP:-none}]: " input_ip
-  FOREIGN_IP="${input_ip:-$FOREIGN_IP}"
+case "$CHOICE" in
+2)
+  install_tools; setup_backend; sysctl_tuning
+  NIC=$(main_iface); [[ -n "$NIC" ]] || die "Cannot detect default network interface."
+  FOREIGN_IP=$(pub_ip)
+  read -rp "Enter FOREIGN server public IP [${FOREIGN_IP:-none}]: " in_ip
+  FOREIGN_IP=${in_ip:-$FOREIGN_IP}
   [[ -n "$FOREIGN_IP" ]] || die "Foreign IP is required."
 
-  echo "Select transport:"
-  echo "  1 - Cloak"
-  echo "  2 - ShadowTLS v3"
-  read -rp "Choice: " transport_choice
+  DEF_PORT=$(rnd 20000 60000)
+  read -rp "AmneziaWG UDP port [random: ${DEF_PORT}]: " AWG_PORT
+  AWG_PORT=${AWG_PORT:-$DEF_PORT}
+  read -rp "Tunnel MTU [1320]: " MTU; MTU=${MTU:-1320}
 
-  case "$transport_choice" in
-    1) MODE="cloak" ;;
-    2) MODE="shadowtls" ;;
-    *) die "Invalid transport choice." ;;
-  esac
+  gen_profile
+  PRIV=$(awg genkey); FR_PUB=$(echo "$PRIV" | awg pubkey); PSK=$(awg genpsk)
+  SELF_ADDR="$FR_ADDR"; IR_PUB=""
+  write_foreign_cfg "$NIC"
+  {
+    echo "ROLE=foreign"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "MTU=${MTU}"
+    echo "PSK=${PSK}"
+    echo "TOKEN=$(encode_token)"
+  } > "$META"; chmod 600 "$META"
+  bring_up
 
-  local default_port
-  default_port=$(rnd 20000 60000)
-
-  read -rp "Public transport TCP port [${default_port}]: " input_port
-  TRANSPORT_PORT="${input_port:-$default_port}"
-  valid_port "$TRANSPORT_PORT" || die "Invalid port."
-
-  read -rp "Decoy host for Cloak [www.cloudflare.com]: " input_decoy
-  DECOY_HOST="${input_decoy:-www.cloudflare.com}"
-
-  SS_METHOD="$DEFAULT_METHOD"
-  SS_PASSWORD=$(random_b64 32)
-
-  CLOAK_UID=""
-  CLOAK_PUBLIC_KEY=""
-  SHADOWTLS_PASSWORD=""
-  SNI_LIST=""
-
-  write_ss_server
-
-  if [[ "$MODE" == "cloak" ]]; then
-    install_cloak
-    write_cloak_foreign
-  else
-    install_shadowtls
-
-    read -rp "SNI list, separated by ; [www.cloudflare.com;www.microsoft.com]: " input_sni
-    SNI_LIST="${input_sni:-www.cloudflare.com;www.microsoft.com}"
-
-    SHADOWTLS_PASSWORD=$(random_b64 32)
-    write_shadowtls_foreign
-  fi
-
-  cat > "$META" <<EOF
-ROLE=foreign
-MODE=${MODE}
-FOREIGN_IP=${FOREIGN_IP}
-TRANSPORT_PORT=${TRANSPORT_PORT}
-DECOY_HOST=${DECOY_HOST}
-SNI_LIST=${SNI_LIST}
-EOF
-  chmod 600 "$META"
-
-  systemctl daemon-reload
-  systemctl enable --now stealth-ss-server.service
-
-  if [[ "$MODE" == "cloak" ]]; then
-    systemctl enable --now cloak-server.service
-  else
-    systemctl enable --now shadowtls-server.service
-  fi
-
-  ok "Foreign ${MODE} server is ready."
   echo
-  echo "${YELLOW}${BOLD}Copy this token to the Iran server:${RESET}"
+  ok "Foreign server configured with v5.0 Anti-DPI & Fragmentation."
+  echo "${YELLOW}${BOLD}Copy this ONE token and paste it on the Iran server (option 1):${RESET}"
   echo "${CYAN}$(encode_token)${RESET}"
   echo
-  echo "Allow TCP port ${TRANSPORT_PORT} in your VPS firewall."
-}
+  ;;
 
-setup_iran() {
-  install_dependencies
-  prepare_dirs
-  write_sysctl
-  disable_transports
+1)
+  install_tools; setup_backend; sysctl_tuning
+  NIC=$(main_iface); [[ -n "$NIC" ]] || die "Cannot detect default network interface."
+  echo "Paste the token printed by the FOREIGN server:"
+  read -rp "> " TOKEN
+  decode_token "$TOKEN"
+  read -rp "Tunnel MTU [1320]: " MTU; MTU=${MTU:-1320}
+  read -rp "TCP ports to KEEP on this Iran server [${KEEP_TCP_PORTS}]: " kp
+  KEEP_TCP_PORTS=${kp:-$KEEP_TCP_PORTS}
 
-  local nic
-  nic=$(main_iface)
-  [[ -n "$nic" ]] || die "Cannot determine default network interface."
+  PRIV=$(awg genkey); IR_PUB=$(echo "$PRIV" | awg pubkey)
+  SELF_ADDR="$IR_ADDR"
+  write_iran_cfg "$NIC"
+  { echo "ROLE=iran"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "MTU=${MTU}"; } > "$META"
+  chmod 600 "$META"
+  bring_up
 
-  echo "Paste the token produced on the foreign server:"
-  read -rp "> " token
-  decode_token "$token"
+  echo
+  ok "Iran server configured with IP Shield."
+  echo "${YELLOW}${BOLD}Iran public key -> paste it on the FOREIGN server (option 3):${RESET}"
+  echo "${CYAN}${IR_PUB}${RESET}"
+  echo
+  wait_handshake || true
+  ;;
 
-  read -rp "TCP ports to keep locally [${KEEP_TCP_PORTS}]: " local_ports
-  KEEP_TCP_PORTS="${local_ports:-$KEEP_TCP_PORTS}"
-  valid_port_list "$KEEP_TCP_PORTS" || die "Invalid TCP port list."
+3)
+  [[ -f "$CFG" ]] || die "No config at ${CFG}. Run option 2 first."
+  read -rp "Enter IRAN server public key: " IR_PUB
+  [[ -n "$IR_PUB" ]] || die "Key is required."
+  PSK_LINE=$(sed -n 's/^PSK=//p' "$META" 2>/dev/null | head -n1)
+  [[ -n "$PSK_LINE" ]] || PSK_LINE=$(awk '/^PresharedKey/{print $3; exit}' "$CFG")
+  [[ -n "$PSK_LINE" ]] || die "Could not recover PresharedKey."
+  
+  awk '/^\[Peer\]/{exit} {print}' "$CFG" > "${CFG}.new"
+  cat >> "${CFG}.new" <<EOF
 
-  if [[ "$MODE" == "cloak" ]]; then
-    install_cloak
-    write_cloak_iran
-    write_ss_redir "$LOCAL_CLOAK_PORT"
-  else
-    install_shadowtls
-    write_shadowtls_iran
-    write_ss_redir "$LOCAL_SHADOWTLS_PORT"
-    write_rotation_tools
-  fi
+[Peer]
+PublicKey = ${IR_PUB}
+PresharedKey = ${PSK_LINE}
+AllowedIPs = ${IR_ADDR}/32
+PersistentKeepalive = 25
+EOF
+  mv "${CFG}.new" "$CFG"; chmod 600 "$CFG"
+  set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
+  awg-quick down "$IFACE" >/dev/null 2>&1 || true
+  awg-quick up "$IFACE" || die "Restart failed."
+  ok "Iran peer added successfully."
+  ;;
 
-  cat > "$META" <<EOF
-ROLE=iran
-MODE=${MODE}
-FOREIGN_IP=${FOREIGN_IP}
-TRANSPORT_PORT=${TRANSPORT_PORT}
+4)
+  awg show "$IFACE" 2>/dev/null || echo "No device active."
+  ;;
+
+5)
+  systemctl disable --now "awg-quick@${IFACE}" >/dev/null 2>&1 || true
+  awg-quick down "$IFACE" >/dev/null 2>&1 || true
+  rm -rf "$CFG_DIR" /etc/sysctl.d/99-awg.conf /etc/modules-load.d/amneziawg.conf
+  ok "Cleaned up."
+  ;;
+*)
+  die "Invalid choice."
+  ;;
+esac
