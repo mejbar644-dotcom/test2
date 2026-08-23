@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # Hysteria 2 Stealth Tunnel (Iran <-> Foreign)
+# Version: 2.1.0
 # Optimized for GFW Evasion (QUIC + Salamander Obfs + TUN)
 # No Domain Required (SHA256 Pinning)
 # Debian / Ubuntu - systemd
@@ -220,7 +221,7 @@ iran_setup() {
   download_binary || die "Binary download failed."
   write_sysctl || die "Sysctl write failed."
 
-  # Create config directory (FIXED BUG)
+  # Create config directory
   mkdir -p "$CFG_DIR"
   chmod 700 "$CFG_DIR"
 
@@ -260,10 +261,11 @@ transport:
 tun:
   name: "${IFACE}"
   mtu: 1350
-  address:
-    - "${IR_ADDR}"
+  timeout: 1000
+  ipv4: "${IR_ADDR}"
   route:
-    - "0.0.0.0/0"
+    ipv4:
+      - "0.0.0.0/0"
   strictRoute: true
 EOF
 
@@ -336,7 +338,7 @@ uninstall_all() {
 
 echo
 echo "=========================================================="
-echo " Hysteria 2 Stealth Tunnel (Anti-GFW Optimized)"
+echo " Hysteria 2 Stealth Tunnel v2.1.0 (Anti-GFW Optimized)"
 echo "=========================================================="
 echo "1) Configure Iran server      (run AFTER foreign)"
 echo "2) Configure foreign server   (run FIRST)"
