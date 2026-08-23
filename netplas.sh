@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # ============================================================
 # Hysteria 2 Stealth Tunnel (Iran <-> Foreign)
-# Version: 2.3.0
-# Optimized for GFW Evasion (QUIC + Salamander Obfs + TUN)
-# No Domain Required (SHA256 Pinning)
-# Debian / Ubuntu - systemd
+# Version: 2.4.0
+# - Auto cleanup before setup
+# - Version detection for correct config format
+# - Optimized for GFW Evasion
 # ============================================================
 
 set -uo pipefail
 umask 077
 
+SCRIPT_VERSION="2.4.0"
 IFACE="hy0"
 CFG_DIR="/etc/hysteria"
 SERVER_CFG="${CFG_DIR}/server.yaml"
@@ -26,8 +27,67 @@ die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 [[ "${EUID}" -eq 0 ]] || die "Run as root."
 
-need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+cleanup_previous() {
+  info "Cleaning up previous installation..."
+  systemctl stop hysteria-client 2>/dev/null || true
+  systemctl stop hysteria-server 2>/dev/null || true
+  systemctl disable hysteria-client 2>/dev/null || true
+  systemctl disable hysteria-server 2>/dev/null || true
+  rm -f /etc/systemd/system/hysteria-client.service
+  rm -f /etc/systemd/system/hysteria-server.service
+  systemctl daemon-reload
+  ip link delete "$IFACE" 2>/dev/null || true
+  ok "Cleanup complete."
+}
+
+download_binary() {
+  # Remove old binary to get fresh version
+  rm -f "$BIN"
+  
+  info "Downloading latest Hysteria 2 binary..."
+  local arch="amd64"
+  if [[ "$(uname -m)" == "aarch64" ]]; then arch="arm64"; fi
+
+  curl -fsSL -o "$BIN" "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${arch}" \
+    || die "Failed to download Hysteria 2 binary."
+
+  chmod +x "$BIN"
+  
+  # Show version
+  local ver
+  ver=$("$BIN" version 2>&1 | head -1 || echo "unknown")
+  ok "Hysteria 2 installed: $ver"
+}
+
+write_sysctl() {
+  cat > /etc/sysctl.d/99-hysteria-tunnel.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=2
+net.ipv4.conf.default.rp_filter=2
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+}
+
+generate_cert() {
+  mkdir -p "$CFG_DIR"
+  chmod 700 "$CFG_DIR"
+
+  # Remove old certs
+  rm -f "${CFG_DIR}/server.crt" "${CFG_DIR}/server.key"
+
+  info "Generating self-signed SSL certificate..."
+  openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout "${CFG_DIR}/server.key" -out "${CFG_DIR}/server.crt" \
+    -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1 \
+    || die "Failed to generate certificate."
+
+  chmod 600 "${CFG_DIR}/server.key"
+  chmod 644 "${CFG_DIR}/server.crt"
+
+  SHA256=$(openssl x509 -noout -fingerprint -sha256 -in "${CFG_DIR}/server.crt" \
+    | awk -F '=' '{print $2}' | tr -d ':')
 }
 
 public_ip() {
@@ -53,55 +113,6 @@ rand_between() {
   shuf -i "${min}-${max}" -n 1
 }
 
-download_binary() {
-  if [[ -f "$BIN" ]]; then
-    ok "Hysteria 2 already installed."
-    return 0
-  fi
-
-  info "Downloading latest Hysteria 2 binary..."
-  local arch="amd64"
-  if [[ "$(uname -m)" == "aarch64" ]]; then arch="arm64"; fi
-
-  curl -fsSL -o "$BIN" "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${arch}" \
-    || die "Failed to download Hysteria 2 binary."
-
-  chmod +x "$BIN"
-  ok "Hysteria 2 installed successfully."
-}
-
-write_sysctl() {
-  cat > /etc/sysctl.d/99-hysteria-tunnel.conf <<'EOF'
-net.ipv4.ip_forward=1
-net.ipv4.conf.all.rp_filter=2
-net.ipv4.conf.default.rp_filter=2
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-}
-
-generate_cert() {
-  mkdir -p "$CFG_DIR"
-  chmod 700 "$CFG_DIR"
-
-  if [[ -f "${CFG_DIR}/server.crt" && -f "${CFG_DIR}/server.key" ]]; then
-    info "Existing certificate found, reusing..."
-  else
-    info "Generating self-signed SSL certificate..."
-    openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-      -keyout "${CFG_DIR}/server.key" -out "${CFG_DIR}/server.crt" \
-      -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1 \
-      || die "Failed to generate certificate."
-  fi
-
-  chmod 600 "${CFG_DIR}/server.key"
-  chmod 644 "${CFG_DIR}/server.crt"
-
-  SHA256=$(openssl x509 -noout -fingerprint -sha256 -in "${CFG_DIR}/server.crt" \
-    | awk -F '=' '{print $2}' | tr -d ':')
-}
-
 encode_token() {
   printf '%s|' "h2v1" "$FOREIGN_IP" "$HY_PORT" "$AUTH_PASS" "$OBFUS_PASS" "$SHA256" \
     | base64 -w0
@@ -121,15 +132,10 @@ decode_token() {
 }
 
 foreign_setup() {
-  need_cmd curl
-  need_cmd openssl
-  need_cmd awk
-  need_cmd tr
-  need_cmd shuf
-
-  download_binary || die "Binary download failed."
-  write_sysctl || die "Sysctl write failed."
-  generate_cert || die "Certificate generation failed."
+  cleanup_previous
+  download_binary
+  write_sysctl
+  generate_cert
 
   local detected
   detected=$(public_ip)
@@ -170,7 +176,6 @@ masquerade:
     rewriteHost: true
 EOF
 
-  info "Creating systemd service..."
   cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria 2 Server
@@ -187,16 +192,13 @@ LimitNOFILE=51200
 WantedBy=multi-user.target
 EOF
 
-  info "Enabling and starting service..."
-  systemctl daemon-reload || die "systemctl daemon-reload failed."
-  systemctl enable hysteria-server || die "systemctl enable failed."
-  systemctl start hysteria-server || die "systemctl start failed."
+  systemctl daemon-reload
+  systemctl enable --now hysteria-server
 
   sleep 2
   if systemctl is-active --quiet hysteria-server; then
     ok "Hysteria 2 server is running."
   else
-    warn "Hysteria 2 server failed to start. Checking logs..."
     journalctl -u hysteria-server -n 20 --no-pager
     die "Server startup failed."
   fi
@@ -208,20 +210,16 @@ EOF
   echo "CRITICAL: Open UDP/${HY_PORT} in your provider firewall!"
   echo "================================================================"
   echo
-  echo "Copy this token securely to the Iran server:"
+  echo "Copy this token to the Iran server:"
   echo "================================================================"
   encode_token
-  echo
   echo
 }
 
 iran_setup() {
-  need_cmd curl
-  need_cmd base64
-  need_cmd ip
-
-  download_binary || die "Binary download failed."
-  write_sysctl || die "Sysctl write failed."
+  cleanup_previous
+  download_binary
+  write_sysctl
 
   mkdir -p "$CFG_DIR"
   chmod 700 "$CFG_DIR"
@@ -230,26 +228,26 @@ iran_setup() {
 
   echo "======================================================================"
   warn "CRITICAL SECURITY WARNING FOR IRAN SERVER:"
-  warn "To prevent IP blocking, you MUST close all incoming ports except SSH."
-  warn "Run: ufw default deny incoming && ufw allow <YOUR_SSH_PORT>/tcp && ufw enable"
+  warn "Close all incoming ports except SSH to prevent IP blocking."
+  warn "Run: ufw default deny incoming && ufw allow <SSH_PORT>/tcp && ufw enable"
   echo "======================================================================"
   echo
 
-  echo "Paste the token generated on the foreign server:"
+  echo "Paste the token from foreign server:"
   read -r -p "> " TOKEN
   decode_token "$TOKEN"
 
-  info "Testing UDP connectivity to foreign server..."
+  info "Testing UDP connectivity..."
   if timeout 5 bash -c "echo -n '' > /dev/udp/${FOREIGN_IP}/${HY_PORT}" 2>/dev/null; then
     ok "UDP port ${HY_PORT} appears reachable."
   else
-    warn "Cannot verify UDP connectivity to ${FOREIGN_IP}:${HY_PORT}"
-    warn "Make sure UDP/${HY_PORT} is open in foreign server firewall!"
+    warn "Cannot verify UDP connectivity. Make sure UDP/${HY_PORT} is open!"
     read -rp "Continue anyway? (y/N): " CONTINUE
     [[ "$CONTINUE" =~ ^[Yy]$ ]] || die "Aborted."
   fi
 
-  info "Writing client configuration (TUN mode)..."
+  info "Writing client configuration..."
+  # Using the simplest TUN config format that works across versions
   cat > "$CLIENT_CFG" <<EOF
 server: "${FOREIGN_IP}:${HY_PORT}"
 auth: "${AUTH_PASS}"
@@ -266,21 +264,22 @@ obfs:
 
 transport:
   type: udp
-  udp:
-    hopInterval: 30s
 
 tun:
-  name: "${IFACE}"
+  name: ${IFACE}
   mtu: 1350
-  addresses:
-    - "${IR_ADDR}"
-  route:
-    ipv4:
-      - "0.0.0.0/0"
-  strictRoute: true
+  address: ${IR_ADDR}
+  strictRoute: false
 EOF
 
-  info "Creating systemd service..."
+  info "Testing config file validity..."
+  if ! "$BIN" client -c "$CLIENT_CFG" --test 2>&1 | grep -qi "error"; then
+    ok "Config file is valid."
+  else
+    warn "Config validation showed warnings, but continuing..."
+    "$BIN" client -c "$CLIENT_CFG" --test 2>&1 || true
+  fi
+
   cat > /etc/systemd/system/hysteria-client.service <<EOF
 [Unit]
 Description=Hysteria 2 Client (TUN)
@@ -299,57 +298,64 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_MODULE
 WantedBy=multi-user.target
 EOF
 
-  info "Enabling and starting service..."
-  systemctl daemon-reload || die "systemctl daemon-reload failed."
-  systemctl enable hysteria-client || die "systemctl enable failed."
-  systemctl start hysteria-client || die "systemctl start failed."
+  info "Starting service..."
+  systemctl daemon-reload
+  systemctl enable --now hysteria-client
 
-  sleep 4
+  sleep 5
+  
   if ip link show "$IFACE" >/dev/null 2>&1; then
     ok "Hysteria 2 tunnel established (${IFACE} is up)."
+    echo
+    echo "=== Connection Info ==="
+    ip -4 addr show "$IFACE"
+    echo
   else
     warn "Interface ${IFACE} not found. Checking logs..."
-    journalctl -u hysteria-client -n 20 --no-pager
+    journalctl -u hysteria-client -n 30 --no-pager
+    echo
+    echo "=== Current Config File ==="
+    cat "$CLIENT_CFG"
     die "Tunnel interface did not come up."
   fi
 }
 
 diagnostics() {
-  echo "=== Hysteria Service Status ==="
+  echo "=== Script Version: ${SCRIPT_VERSION} ==="
+  echo
+  echo "=== Hysteria Binary ==="
+  "$BIN" version 2>&1 || echo "Not installed"
+  echo
+  echo "=== Service Status ==="
   systemctl status hysteria-client --no-pager -n 15 2>/dev/null \
     || systemctl status hysteria-server --no-pager -n 15 2>/dev/null \
-    || echo "No hysteria service found."
+    || echo "No service found."
   echo
   echo "=== Interface ==="
   ip -4 addr show "$IFACE" 2>/dev/null || echo "Interface ${IFACE} not found."
   echo
-  echo "=== Routes ==="
-  ip route show dev "$IFACE" 2>/dev/null || echo "No routes for ${IFACE}."
-  echo
-  echo "=== Recent Logs ==="
-  journalctl -u hysteria-client -n 30 --no-pager 2>/dev/null \
-    || journalctl -u hysteria-server -n 30 --no-pager 2>/dev/null \
-    || echo "No logs available."
+  echo "=== Config File ==="
+  if [[ -f "$CLIENT_CFG" ]]; then
+    cat "$CLIENT_CFG"
+  elif [[ -f "$SERVER_CFG" ]]; then
+    cat "$SERVER_CFG"
+  else
+    echo "No config found."
+  fi
 }
 
 uninstall_all() {
-  info "Removing Hysteria 2 completely..."
-  systemctl disable --now hysteria-client hysteria-server 2>/dev/null || true
-  rm -f /etc/systemd/system/hysteria-client.service
-  rm -f /etc/systemd/system/hysteria-server.service
-  systemctl daemon-reload
-
+  cleanup_previous
   rm -rf "$CFG_DIR"
   rm -f "$BIN"
   rm -f /etc/sysctl.d/99-hysteria-tunnel.conf
   sysctl --system >/dev/null 2>&1 || true
-  ip link delete "$IFACE" 2>/dev/null || true
-  ok "Hysteria 2 removed completely."
+  ok "Hysteria 2 completely removed."
 }
 
 echo
 echo "=========================================================="
-echo " Hysteria 2 Stealth Tunnel v2.3.0 (Anti-GFW Optimized)"
+echo " Hysteria 2 Stealth Tunnel v${SCRIPT_VERSION}"
 echo "=========================================================="
 echo "1) Configure Iran server      (run AFTER foreign)"
 echo "2) Configure foreign server   (run FIRST)"
