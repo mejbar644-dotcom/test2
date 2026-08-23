@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # Hysteria 2 Stealth Tunnel (Iran <-> Foreign)
-# Version: 2.1.0
+# Version: 2.2.0
 # Optimized for GFW Evasion (QUIC + Salamander Obfs + TUN)
 # No Domain Required (SHA256 Pinning)
 # Debian / Ubuntu - systemd
@@ -261,11 +261,10 @@ transport:
 tun:
   name: "${IFACE}"
   mtu: 1350
-  timeout: 1000
-  ipv4: "${IR_ADDR}"
+  addresses:
+    - "${IR_ADDR}"
   route:
-    ipv4:
-      - "0.0.0.0/0"
+    - "0.0.0.0/0"
   strictRoute: true
 EOF
 
@@ -338,7 +337,7 @@ uninstall_all() {
 
 echo
 echo "=========================================================="
-echo " Hysteria 2 Stealth Tunnel v2.1.0 (Anti-GFW Optimized)"
+echo " Hysteria 2 Stealth Tunnel v2.2.0 (Anti-GFW Optimized)"
 echo "=========================================================="
 echo "1) Configure Iran server      (run AFTER foreign)"
 echo "2) Configure foreign server   (run FIRST)"
