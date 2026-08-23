@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 # Hysteria 2 Stealth Tunnel (Iran <-> Foreign)
-# Version: 2.2.0
+# Version: 2.3.0
 # Optimized for GFW Evasion (QUIC + Salamander Obfs + TUN)
 # No Domain Required (SHA256 Pinning)
 # Debian / Ubuntu - systemd
@@ -203,9 +203,11 @@ EOF
 
   echo
   ok "Foreign side is ready."
-  echo "Open UDP/${HY_PORT} in your provider firewall/security group."
   echo
   echo "================================================================"
+  echo "CRITICAL: Open UDP/${HY_PORT} in your provider firewall!"
+  echo "================================================================"
+  echo
   echo "Copy this token securely to the Iran server:"
   echo "================================================================"
   encode_token
@@ -221,7 +223,6 @@ iran_setup() {
   download_binary || die "Binary download failed."
   write_sysctl || die "Sysctl write failed."
 
-  # Create config directory
   mkdir -p "$CFG_DIR"
   chmod 700 "$CFG_DIR"
 
@@ -237,6 +238,16 @@ iran_setup() {
   echo "Paste the token generated on the foreign server:"
   read -r -p "> " TOKEN
   decode_token "$TOKEN"
+
+  info "Testing UDP connectivity to foreign server..."
+  if timeout 5 bash -c "echo -n '' > /dev/udp/${FOREIGN_IP}/${HY_PORT}" 2>/dev/null; then
+    ok "UDP port ${HY_PORT} appears reachable."
+  else
+    warn "Cannot verify UDP connectivity to ${FOREIGN_IP}:${HY_PORT}"
+    warn "Make sure UDP/${HY_PORT} is open in foreign server firewall!"
+    read -rp "Continue anyway? (y/N): " CONTINUE
+    [[ "$CONTINUE" =~ ^[Yy]$ ]] || die "Aborted."
+  fi
 
   info "Writing client configuration (TUN mode)..."
   cat > "$CLIENT_CFG" <<EOF
@@ -264,7 +275,8 @@ tun:
   addresses:
     - "${IR_ADDR}"
   route:
-    - "0.0.0.0/0"
+    ipv4:
+      - "0.0.0.0/0"
   strictRoute: true
 EOF
 
@@ -337,7 +349,7 @@ uninstall_all() {
 
 echo
 echo "=========================================================="
-echo " Hysteria 2 Stealth Tunnel v2.2.0 (Anti-GFW Optimized)"
+echo " Hysteria 2 Stealth Tunnel v2.3.0 (Anti-GFW Optimized)"
 echo "=========================================================="
 echo "1) Configure Iran server      (run AFTER foreign)"
 echo "2) Configure foreign server   (run FIRST)"
