@@ -1,19 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# AmneziaWG Stable Iran <-> Foreign Tunnel  (Option A: full tunnel)
+# AmneziaWG Stealth Tunnel (Iran <-> Foreign)
+# Optimized for DPI Evasion & Anti-Fingerprinting
 # Debian / Ubuntu - nftables - systemd
-#
-# CHANGES vs original (Option A):
-#   1. Iran peer AllowedIPs = 0.0.0.0/0  -> ALL server outbound
-#      goes through the tunnel; nothing leaks from the Iran IP
-#      directly (except the tunnel endpoint UDP, auto-handled).
-#   2. Iran KEEP_TCP default = "22" only (management). Every other
-#      incoming TCP port is DNAT'd to the foreign server.
-#   3. MTU default lowered to 1280 (fixes fragmentation black-holes
-#      that cause random drops on some providers).
-#   4. Added a systemd watchdog that restarts the tunnel if the
-#      handshake dies, so user sessions recover automatically.
-# Foreign side: NO change needed.
 # ============================================================
 
 set -Eeuo pipefail
@@ -24,15 +13,10 @@ CFG_DIR="/etc/amnezia/amneziawg"
 CFG="${CFG_DIR}/${IFACE}.conf"
 META="${CFG_DIR}/${IFACE}.meta"
 FW_HELPER="/usr/local/sbin/awg-nft"
-WATCHDOG="/usr/local/sbin/awg-watchdog"
-WATCHDOG_SVC="/etc/systemd/system/awg-watchdog.service"
 IR_ADDR="10.77.0.2"
 FR_ADDR="10.77.0.1"
 CIDR="30"
-# Only management ports that must stay LOCAL on the Iran server.
-# Everything else is DNAT'd through the tunnel.
-DEFAULT_KEEP_TCP="22,80,443,10052"
-IR_MGMT_TCP="22"
+DEFAULT_KEEP_TCP="22" # Changed default: Only keep SSH open on Iran side for max stealth
 
 info() { printf '\033[36m[*]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m[+]\033[0m %s\n' "$*"; }
@@ -103,71 +87,42 @@ install_packages() {
 }
 
 write_sysctl() {
-  # Load conntrack module early so the sysctls below exist.
-  modprobe nf_conntrack 2>/dev/null || true
-  modprobe nf_conntrack_ipv4 2>/dev/null || true
-
   cat > /etc/sysctl.d/99-amneziawg-tunnel.conf <<'EOF'
-# --- forwarding / routing ---
 net.ipv4.ip_forward=1
 net.ipv4.conf.all.rp_filter=2
 net.ipv4.conf.default.rp_filter=2
-net.ipv4.tcp_mtu_probing=1
+# net.ipv4.tcp_mtu_probing=1  # DISABLED: Prevents DPI fingerprinting via MTU probes
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-
-# --- conntrack: prevent drops under heavy TCP load ---
-# Default is often 65536; raise so many user sessions fit.
-net.netfilter.nf_conntrack_max=1048576
-# Hash buckets must be set at module load; 256k is a safe big value.
-# (If the module is already loaded this is a no-op, which is fine.)
-net.netfilter.nf_conntrack_buckets=262144
-# Keep established TCP entries longer so long-lived user sessions
-# are not garbage-collected during brief stalls.
-net.netfilter.nf_conntrack_tcp_timeout_established=7200
-net.netfilter.nf_conntrack_tcp_timeout_time_wait=30
-net.netfilter.nf_conntrack_udp_timeout=60
-net.netfilter.nf_conntrack_udp_timeout_stream=180
-
-# --- UDP buffers for AmneziaWG under load ---
-net.core.rmem_max=67108864
-net.core.wmem_max=67108864
-net.core.rmem_default=262144
-net.core.wmem_default=262144
-net.core.netdev_max_backlog=2500
-net.core.netdev_budget=600
-net.core.netdev_budget_usecs=8000
-
-# --- TCP tuning for many concurrent user connections ---
-net.ipv4.tcp_max_syn_backlog=8192
-net.ipv4.tcp_fin_timeout=15
-net.ipv4.tcp_tw_reuse=1
-net.ipv4.ip_local_port_range=1024 65535
 EOF
   sysctl --system >/dev/null 2>&1 || true
 }
 
+# Optimized for QUIC/TLS traffic mimicry
 generate_profile() {
-  JC=$(rand_between 4 10)
-  JMIN=$(rand_between 64 160)
-  JMAX=$(rand_between "$((JMIN + 128))" 768)
+  # Junk Count: Keep low to avoid obvious padding anomalies
+  JC=$(rand_between 2 4)
+  
+  # Junk Size: Mimic typical TLS/QUIC record sizes
+  JMIN=$(rand_between 150 300)
+  JMAX=$(rand_between 400 600)
 
-  S1=$(rand_between 15 63)
-  S2=$(rand_between 15 63)
-  while [[ "$S2" == "$S1" ]]; do
-    S2=$(rand_between 15 63)
-  done
-  S3=$(rand_between 15 63)
-  S4=$(rand_between 15 31)
+  # Fragmentation: Smaller, realistic chunks
+  S1=$(rand_between 15 30)
+  S2=$(rand_between 40 60)
+  S3=$(rand_between 15 30)
+  S4=$(rand_between 5 15)
 
-  H1=$(rand_between 100000 2000000000)
-  H2=$(rand_between 100000 2000000000)
-  H3=$(rand_between 100000 2000000000)
-  H4=$(rand_between 100000 2000000000)
+  # Headers: Realistic ranges
+  H1=$(rand_between 500000 1000000)
+  H2=$(rand_between 500000 1000000)
+  H3=$(rand_between 500000 1000000)
+  H4=$(rand_between 500000 1000000)
 
-  while [[ "$H2" == "$H1" ]]; do H2=$(rand_between 100000 2000000000); done
-  while [[ "$H3" == "$H1" || "$H3" == "$H2" ]]; do H3=$(rand_between 100000 2000000000); done
-  while [[ "$H4" == "$H1" || "$H4" == "$H2" || "$H4" == "$H3" ]]; do H4=$(rand_between 100000 2000000000); done
+  # Ensure uniqueness for H values
+  while [[ "$H2" == "$H1" ]]; do H2=$(rand_between 500000 1000000); done
+  while [[ "$H3" == "$H1" || "$H3" == "$H2" ]]; do H3=$(rand_between 500000 1000000); done
+  while [[ "$H4" == "$H1" || "$H4" == "$H2" || "$H4" == "$H3" ]]; do H4=$(rand_between 500000 1000000); done
 }
 
 encode_token() {
@@ -218,10 +173,6 @@ case "$ACTION:$ROLE" in
 
   up:iran)
     delete_rules
-
-    # DNAT every incoming TCP except management ports (KEEP_TCP),
-    # and every UDP except the tunnel port. Nothing leaves the Iran
-    # IP directly except the tunnel endpoint (handled by routing).
     nft -f - <<EOF_NFT
 table ip awg_tunnel {
   chain prerouting {
@@ -229,20 +180,17 @@ table ip awg_tunnel {
     iifname "$NIC" tcp dport != { $KEEP_TCP } dnat to 10.77.0.1
     iifname "$NIC" udp dport != $AWG_PORT dnat to 10.77.0.1
   }
-
   chain postrouting {
     type nat hook postrouting priority srcnat; policy accept;
     oifname "$IFACE" masquerade
   }
 }
-
 table inet awg_tunnel {
   chain forward_filter {
     type filter hook forward priority filter; policy accept;
     iifname "$NIC" oifname "$IFACE" accept
     iifname "$IFACE" oifname "$NIC" ct state established,related accept
   }
-
   chain forward_mangle {
     type filter hook forward priority mangle; policy accept;
     tcp flags syn tcp option maxseg size set rt mtu
@@ -253,7 +201,6 @@ EOF_NFT
 
   up:foreign)
     delete_rules
-
     nft -f - <<EOF_NFT
 table ip awg_tunnel {
   chain postrouting {
@@ -261,14 +208,12 @@ table ip awg_tunnel {
     ip saddr $IR_ADDR oifname "$NIC" masquerade
   }
 }
-
 table inet awg_tunnel {
   chain forward_filter {
     type filter hook forward priority filter; policy accept;
     iifname "$IFACE" oifname "$NIC" accept
     iifname "$NIC" oifname "$IFACE" ct state established,related accept
   }
-
   chain forward_mangle {
     type filter hook forward priority mangle; policy accept;
     tcp flags syn tcp option maxseg size set rt mtu
@@ -284,70 +229,6 @@ EOF_NFT
 esac
 EOF
   chmod 700 "$FW_HELPER"
-}
-
-# Watchdog: restart the tunnel if the handshake has been dead for a while.
-# Only installed on the Iran side. Does NOT touch SSH, so you never lose
-# management access even if the tunnel is down.
-write_watchdog() {
-  cat > "$WATCHDOG" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-IFACE="awg0"
-DEAD=0
-for _ in $(seq 1 3); do
-  if ! awg show "$IFACE" latest-handshakes 2>/dev/null \
-       | awk '$2>0{found=1} END{exit !found}'; then
-    DEAD=$((DEAD+1))
-    sleep 5
-  else
-    DEAD=0
-    break
-  fi
-done
-if [[ "$DEAD" -ge 3 ]]; then
-  echo "awg-watchdog: no handshake, restarting $IFACE" >&2
-  awg-quick down "$IFACE" >/dev/null 2>&1 || true
-  sleep 2
-  awg-quick up "$IFACE" >/dev/null 2>&1 || true
-fi
-EOF
-  chmod 700 "$WATCHDOG"
-
-  cat > "$WATCHDOG_SVC" <<'EOF'
-[Unit]
-Description=AmneziaWG tunnel watchdog
-After=network-online.target awg-quick@awg0.service
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/awg-watchdog
-
-[Timer]
-OnBootSec=60s
-OnUnitActiveSec=30s
-Unit=awg-watchdog.service
-
-[Install]
-WantedBy=timers.target
-EOF
-  # Enable the timer (not the oneshot service directly).
-  ln -sf "$WATCHDOG_SVC" "/etc/systemd/system/awg-watchdog.timer" 2>/dev/null || true
-  {
-    echo "[Unit]"
-    echo "Description=AmneziaWG tunnel watchdog timer"
-    echo ""
-    echo "[Timer]"
-    echo "OnBootSec=60s"
-    echo "OnUnitActiveSec=30s"
-    echo "Unit=awg-watchdog.service"
-    echo ""
-    echo "[Install]"
-    echo "WantedBy=timers.target"
-  } > "/etc/systemd/system/awg-watchdog.timer"
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl enable --now awg-watchdog.timer >/dev/null 2>&1 || true
 }
 
 common_interface() {
@@ -371,6 +252,11 @@ H4 = ${H4}
 PostUp = ${FW_HELPER} up ${ROLE} ${NIC} %i ${AWG_PORT} ${KEEP_TCP_PORTS} ${IR_ADDR}
 PostDown = ${FW_HELPER} down ${ROLE} ${NIC} %i ${AWG_PORT} ${KEEP_TCP_PORTS} ${IR_ADDR}
 EOF
+
+  # Prevent DNS leaks on the Iran side
+  if [[ "$ROLE" == "iran" ]]; then
+    echo "DNS = 10.77.0.1"
+  fi
 }
 
 write_config() {
@@ -390,7 +276,7 @@ EOF
     if [[ "$ROLE" == "iran" ]]; then
       cat <<EOF
 Endpoint = ${FOREIGN_IP}:${AWG_PORT}
-PersistentKeepalive = 25
+PersistentKeepalive = 17
 EOF
     fi
   } > "$CFG"
@@ -455,8 +341,8 @@ foreign_setup() {
   AWG_PORT="${AWG_PORT:-$default_port}"
   valid_port "$AWG_PORT" || die "Invalid UDP port."
 
-  read -rp "Tunnel MTU [1280]: " MTU
-  MTU="${MTU:-1280}"
+  read -rp "Tunnel MTU [1360]: " MTU
+  MTU="${MTU:-1360}"
   [[ "$MTU" =~ ^[0-9]+$ ]] && (( MTU >= 1200 && MTU <= 1420 )) || die "MTU must be 1200-1420."
 
   KEEP_TCP_PORTS="$DEFAULT_KEEP_TCP"
@@ -493,24 +379,28 @@ iran_setup() {
   install_packages
   write_sysctl
   write_fw_helper
-  write_watchdog
 
   ROLE="iran"
   NIC=$(default_nic)
   [[ -n "$NIC" ]] || die "Could not detect default network interface."
 
+  echo "======================================================================"
+  warn "CRITICAL SECURITY WARNING FOR IRAN SERVER:"
+  warn "To prevent IP blocking, you MUST close all incoming ports except SSH."
+  warn "Run this command after setup: ufw default deny incoming && ufw allow <YOUR_SSH_PORT>/tcp && ufw enable"
+  echo "======================================================================"
+  echo
+
   echo "Paste the token generated on the foreign server:"
   read -r -p "> " TOKEN
   decode_token "$TOKEN"
 
-  read -rp "Tunnel MTU [1280]: " MTU
-  MTU="${MTU:-1280}"
+  read -rp "Tunnel MTU [1360]: " MTU
+  MTU="${MTU:-1360}"
   [[ "$MTU" =~ ^[0-9]+$ ]] && (( MTU >= 1200 && MTU <= 1420 )) || die "MTU must be 1200-1420."
 
-  # Only management ports stay local on Iran. Everything else (all
-  # random user ports) is tunneled to the foreign server.
-  read -rp "Local management TCP ports [${IR_MGMT_TCP}]: " KEEP_TCP_PORTS
-  KEEP_TCP_PORTS="${KEEP_TCP_PORTS:-$IR_MGMT_TCP}"
+  read -rp "TCP ports that must remain open on Iran server [${DEFAULT_KEEP_TCP}]: " KEEP_TCP_PORTS
+  KEEP_TCP_PORTS="${KEEP_TCP_PORTS:-$DEFAULT_KEEP_TCP}"
   [[ "$KEEP_TCP_PORTS" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "Ports must look like: 22"
 
   PRIV=$(awg genkey)
@@ -518,17 +408,14 @@ iran_setup() {
 
   SELF_ADDR="$IR_ADDR"
   PEER_PUB="$FR_PUB"
-  # Option A: route ALL traffic through the tunnel (0.0.0.0/0).
-  # awg-quick automatically adds a host route for the foreign endpoint
-  # so the tunnel itself does not loop.
-  PEER_ALLOWED="0.0.0.0/0"
+  PEER_ALLOWED="${FR_ADDR}/32"
 
   write_config
   save_meta
   bring_up
 
   echo
-  ok "Iran side is ready (full tunnel mode)."
+  ok "Iran side is ready."
   echo "Paste this Iran public key on the foreign server, option 3:"
   echo
   echo "$IR_PUB"
@@ -573,39 +460,15 @@ diagnostics() {
   ip -4 addr show "$IFACE" 2>/dev/null || true
   ip -4 route get "$FR_ADDR" 2>/dev/null || true
   echo
-  echo "=== Conntrack usage (if near limit -> drops) ==="
-  local ct_max ct_count
-  ct_max=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo 0)
-  ct_count=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo 0)
-  echo "entries: ${ct_count} / ${ct_max}"
-  if [[ "$ct_max" -gt 0 ]]; then
-    awk -v c="$ct_count" -v m="$ct_max" 'BEGIN{p=(c/m)*100; printf "used: %.1f%%\n", p}'
-  fi
-  cat /proc/net/stat/nf_conntrack 2>/dev/null | head -2 || true
-  echo
-  echo "=== UDP/TCP buffer errors (drop counter) ==="
-  nstat -az UdpRcvbufErrors UdpSndbufErrors UdpInErrors TcpExtListenDrops 2>/dev/null || true
-  echo
-  echo "=== Interface drops/overruns ==="
-  ip -s link show "$IFACE" 2>/dev/null | tail -5 || true
-  ip -s link show "$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')" 2>/dev/null | tail -5 || true
-  echo
   echo "=== Dedicated nftables rules ==="
   nft list table ip awg_tunnel 2>/dev/null || true
   nft list table inet awg_tunnel 2>/dev/null || true
-  echo
-  echo "=== Watchdog timer ==="
-  systemctl status awg-watchdog.timer --no-pager 2>/dev/null || true
   echo
   echo "=== Recent service logs ==="
   journalctl -u "awg-quick@${IFACE}" -n 40 --no-pager 2>/dev/null || true
 }
 
 uninstall_all() {
-  systemctl disable --now awg-watchdog.timer >/dev/null 2>&1 || true
-  rm -f "$WATCHDOG" "$WATCHDOG_SVC" "/etc/systemd/system/awg-watchdog.timer" 2>/dev/null || true
-  systemctl daemon-reload >/dev/null 2>&1 || true
-
   systemctl disable --now "awg-quick@${IFACE}" >/dev/null 2>&1 || true
   awg-quick down "$IFACE" >/dev/null 2>&1 || true
   ip link delete "$IFACE" >/dev/null 2>&1 || true
@@ -618,9 +481,9 @@ uninstall_all() {
 }
 
 echo
-echo "AmneziaWG Stable Tunnel (Option A: full tunnel)"
-echo "1) Configure Iran server      (run after foreign)"
-echo "2) Configure foreign server   (run first)"
+echo "AmneziaWG Stealth Tunnel (Anti-DPI Optimized)"
+echo "1) Configure Iran server      (run AFTER foreign)"
+echo "2) Configure foreign server   (run FIRST)"
 echo "3) Foreign: add Iran peer public key"
 echo "4) Diagnostics"
 echo "5) Uninstall tunnel"
