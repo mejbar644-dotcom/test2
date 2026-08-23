@@ -6,7 +6,7 @@
 # Debian / Ubuntu - systemd
 # ============================================================
 
-set -Eeuo pipefail
+set -uo pipefail
 umask 077
 
 IFACE="hy0"
@@ -131,9 +131,9 @@ foreign_setup() {
   need_cmd tr
   need_cmd shuf
 
-  download_binary
-  write_sysctl
-  generate_cert
+  download_binary || die "Binary download failed."
+  write_sysctl || die "Sysctl write failed."
+  generate_cert || die "Certificate generation failed."
 
   local detected
   detected=$(public_ip)
@@ -174,6 +174,7 @@ masquerade:
     rewriteHost: true
 EOF
 
+  info "Creating systemd service..."
   cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria 2 Server
@@ -190,14 +191,18 @@ LimitNOFILE=51200
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now hysteria-server
+  info "Enabling and starting service..."
+  systemctl daemon-reload || die "systemctl daemon-reload failed."
+  systemctl enable hysteria-server || die "systemctl enable failed."
+  systemctl start hysteria-server || die "systemctl start failed."
 
   sleep 2
   if systemctl is-active --quiet hysteria-server; then
     ok "Hysteria 2 server is running."
   else
-    die "Hysteria 2 server failed to start. Check: journalctl -u hysteria-server"
+    warn "Hysteria 2 server failed to start. Checking logs..."
+    journalctl -u hysteria-server -n 20 --no-pager
+    die "Server startup failed."
   fi
 
   echo
@@ -217,8 +222,8 @@ iran_setup() {
   need_cmd base64
   need_cmd ip
 
-  download_binary
-  write_sysctl
+  download_binary || die "Binary download failed."
+  write_sysctl || die "Sysctl write failed."
 
   modprobe tun 2>/dev/null || true
 
@@ -263,6 +268,7 @@ tun:
   strictRoute: true
 EOF
 
+  info "Creating systemd service..."
   cat > /etc/systemd/system/hysteria-client.service <<EOF
 [Unit]
 Description=Hysteria 2 Client (TUN)
@@ -281,28 +287,19 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_MODULE
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-  systemctl enable --now hysteria-client
+  info "Enabling and starting service..."
+  systemctl daemon-reload || die "systemctl daemon-reload failed."
+  systemctl enable hysteria-client || die "systemctl enable failed."
+  systemctl start hysteria-client || die "systemctl start failed."
 
   sleep 4
   if ip link show "$IFACE" >/dev/null 2>&1; then
     ok "Hysteria 2 tunnel established (${IFACE} is up)."
   else
-    warn "Interface ${IFACE} not found. Check: journalctl -u hysteria-client"
+    warn "Interface ${IFACE} not found. Checking logs..."
+    journalctl -u hysteria-client -n 20 --no-pager
+    die "Tunnel interface did not come up."
   fi
-}
-
-wait_connection() {
-  info "Waiting up to 20 seconds for tunnel to come up..."
-  for _ in $(seq 1 20); do
-    if ip link show "$IFACE" >/dev/null 2>&1; then
-      ok "Tunnel interface is up."
-      return 0
-    fi
-    sleep 1
-  done
-  warn "Tunnel interface did not come up. Check logs and firewall."
-  return 1
 }
 
 diagnostics() {
