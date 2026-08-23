@@ -29,11 +29,6 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
 
-default_nic() {
-  ip -4 route show default 2>/dev/null \
-    | awk '{for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}'
-}
-
 public_ip() {
   curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || true
 }
@@ -224,6 +219,10 @@ iran_setup() {
 
   download_binary || die "Binary download failed."
   write_sysctl || die "Sysctl write failed."
+
+  # Create config directory (FIXED BUG)
+  mkdir -p "$CFG_DIR"
+  chmod 700 "$CFG_DIR"
 
   modprobe tun 2>/dev/null || true
 
