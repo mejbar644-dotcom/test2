@@ -1,374 +1,618 @@
 #!/usr/bin/env bash
 # ============================================================
-# Hysteria 2 Stealth Tunnel (Iran <-> Foreign)
-# Version: 2.4.0
-# - Auto cleanup before setup
-# - Version detection for correct config format
-# - Optimized for GFW Evasion
+#  Netplas - AmneziaWG Anti-Filter Tunnel v5.0 (Iran <-> Foreign)
+#
+#  Changes vs v4.2:
+#   - Real AmneziaWG 2.0 profile: H1-H4 as non-overlapping RANGES,
+#     I1 handshake mimicry (QUIC-like / DNS-like), S1-S4, Jc/Jmin/Jmax
+#   - Automatic fallback to the legacy (1.x) profile when the installed
+#     AmneziaWG rejects the 2.0 syntax (or force it: FORCE_LEGACY=1)
+#   - Iran side uses its own random ListenPort (src port != dst port)
+#   - Forwarding mode: all-but-keep / only listed ports / none
+#   - SSH port auto-protected, install log + version report
+#   - Option 3 adds the Iran peer LIVE (awg set), no tunnel restart
+#
+#  NOTE: tokens are v5 and NOT compatible with v4.2. Uninstall the
+#  old setup (option 5) on both servers before installing this one.
 # ============================================================
 
 set -uo pipefail
-umask 077
 
-SCRIPT_VERSION="2.4.0"
-IFACE="hy0"
-CFG_DIR="/etc/hysteria"
-SERVER_CFG="${CFG_DIR}/server.yaml"
-CLIENT_CFG="${CFG_DIR}/client.yaml"
-BIN="/usr/local/bin/hysteria"
+IFACE="awg0"
+CFG_DIR="/etc/amnezia/amneziawg"
+CFG="${CFG_DIR}/${IFACE}.conf"
+META="${CFG_DIR}/${IFACE}.meta"
+LOG="/var/log/netplas-install.log"
+IR_ADDR="10.0.0.2"
+FR_ADDR="10.0.0.1"
+CIDR="30"
+DEF_KEEP_TCP="22,80,443,10052"   # TCP ports that must stay on the Iran server
 
-IR_ADDR="10.77.0.2/30"
-FR_ADDR="10.77.0.1/30"
+# ---------- colors (safe when TERM is unset) ----------
+if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && tput setaf 1 >/dev/null 2>&1; then
+  CYAN=$(tput setaf 6); YELLOW=$(tput setaf 3); GREEN=$(tput setaf 2)
+  RED=$(tput setaf 1); BOLD=$(tput bold); RESET=$(tput sgr0)
+else
+  CYAN=""; YELLOW=""; GREEN=""; RED=""; BOLD=""; RESET=""
+fi
+info()  { echo "${CYAN}[*]${RESET} $*"; }
+ok()    { echo "${GREEN}[+]${RESET} $*"; }
+warn()  { echo "${YELLOW}[!]${RESET} $*"; }
+err()   { echo "${RED}[x]${RESET} $*" >&2; }
+die()   { err "$*"; exit 1; }
 
-info() { printf '\033[36m[*]\033[0m %s\n' "$*"; }
-ok()   { printf '\033[32m[+]\033[0m %s\n' "$*"; }
-warn() { printf '\033[33m[!]\033[0m %s\n' "$*"; }
-die()  { printf '\033[31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
-
-[[ "${EUID}" -eq 0 ]] || die "Run as root."
-
-cleanup_previous() {
-  info "Cleaning up previous installation..."
-  systemctl stop hysteria-client 2>/dev/null || true
-  systemctl stop hysteria-server 2>/dev/null || true
-  systemctl disable hysteria-client 2>/dev/null || true
-  systemctl disable hysteria-server 2>/dev/null || true
-  rm -f /etc/systemd/system/hysteria-client.service
-  rm -f /etc/systemd/system/hysteria-server.service
-  systemctl daemon-reload
-  ip link delete "$IFACE" 2>/dev/null || true
-  ok "Cleanup complete."
+banner() {
+  echo "${CYAN}${BOLD}"
+  echo "===================================="
+  echo "          GitHub: Netplas"
+  echo "  AmneziaWG Anti-Filter Tunnel v5.0"
+  echo "===================================="
+  echo "${RESET}"
 }
 
-download_binary() {
-  # Remove old binary to get fresh version
-  rm -f "$BIN"
-  
-  info "Downloading latest Hysteria 2 binary..."
-  local arch="amd64"
-  if [[ "$(uname -m)" == "aarch64" ]]; then arch="arm64"; fi
-
-  curl -fsSL -o "$BIN" "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${arch}" \
-    || die "Failed to download Hysteria 2 binary."
-
-  chmod +x "$BIN"
-  
-  # Show version
-  local ver
-  ver=$("$BIN" version 2>&1 | head -1 || echo "unknown")
-  ok "Hysteria 2 installed: $ver"
+# ---------- helpers ----------
+rnd() { # rnd MIN MAX -> random integer in [MIN, MAX]
+  local min=$1 max=$2 span=$(( $2 - $1 + 1 ))
+  echo $(( min + ( $(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % span ) ))
 }
 
-write_sysctl() {
-  cat > /etc/sysctl.d/99-hysteria-tunnel.conf <<'EOF'
-net.ipv4.ip_forward=1
-net.ipv4.conf.all.rp_filter=2
-net.ipv4.conf.default.rp_filter=2
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
+main_iface() {
+  ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
+}
+
+pub_ip() { curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true; }
+
+udp_port_busy() {
+  ss -Hulnp 2>/dev/null | awk -v p="$1" '$4 ~ (":" p "$") {f=1} END{exit !f}'
+}
+
+ssh_ports() {
+  ss -Htlnp 2>/dev/null | awk '/sshd/{n=split($4,a,":"); print a[n]}' | sort -un | paste -sd, -
+}
+
+merge_ports() { # merge_ports "a,b" "c,d" -> unique, comma separated
+  printf '%s\n' "$@" | tr ',' '\n' | sed '/^$/d' | sort -u | paste -sd, -
+}
+
+# ---------- install ----------
+detect_os() {
+  . /etc/os-release 2>/dev/null || true
+  OS_ID="${ID:-unknown}"
+}
+
+show_versions() {
+  local tools kmod
+  tools=$(awg --version 2>/dev/null | head -n1 || true)
+  kmod=$(modinfo amneziawg 2>/dev/null | awk '/^version:/{print $2}')
+  info "awg tools : ${tools:-unknown}"
+  if [[ -n "$kmod" ]]; then info "kernel mod: ${kmod}"; fi
+  if command -v amneziawg-go >/dev/null 2>&1; then
+    info "userspace : $(amneziawg-go --version 2>/dev/null | head -n1 || echo amneziawg-go)"
+  fi
+  warn "Both servers MUST run versions that support the same profile (compare these lines)."
+}
+
+install_tools() {
+  detect_os
+  info "Installing prerequisites (log: ${LOG})..."
+  export DEBIAN_FRONTEND=noninteractive
+  : > "$LOG"
+  apt-get update -qq >>"$LOG" 2>&1
+  apt-get install -y -qq curl wget git iptables iproute2 openresolv \
+      software-properties-common ca-certificates build-essential \
+      "linux-headers-$(uname -r)" >>"$LOG" 2>&1 || \
+  apt-get install -y -qq curl wget git iptables iproute2 \
+      software-properties-common ca-certificates build-essential >>"$LOG" 2>&1
+
+  if [[ "$OS_ID" == "ubuntu" ]]; then
+    add-apt-repository -y ppa:amnezia/ppa >>"$LOG" 2>&1 || warn "PPA unreachable (see ${LOG})."
+    apt-get update -qq >>"$LOG" 2>&1
+    apt-get install -y -qq amneziawg amneziawg-tools >>"$LOG" 2>&1 || warn "amneziawg package install failed (see ${LOG})."
+  fi
+
+  if ! command -v awg >/dev/null 2>&1; then
+    warn "Package not available; building amneziawg-tools from source..."
+    rm -rf /tmp/awg-tools
+    git clone -q --depth 1 https://github.com/amnezia-vpn/amneziawg-tools /tmp/awg-tools >>"$LOG" 2>&1 \
+      || die "Cannot fetch amneziawg-tools (GitHub unreachable from this server?). See ${LOG}."
+    make -s -C /tmp/awg-tools/src -j"$(nproc)" >>"$LOG" 2>&1 \
+      && make -s -C /tmp/awg-tools/src install >>"$LOG" 2>&1 \
+      || die "Build of amneziawg-tools failed. See ${LOG}."
+  fi
+  command -v awg >/dev/null 2>&1 || die "'awg' still not found."
+  ok "amneziawg-tools ready ($(command -v awg))."
+}
+
+kernel_ok() {
+  modprobe amneziawg >/dev/null 2>&1
+  ip link add dev awgtest type amneziawg >/dev/null 2>&1 || return 1
+  ip link del awgtest >/dev/null 2>&1
+  return 0
+}
+
+install_userspace() {
+  if command -v amneziawg-go >/dev/null 2>&1; then ok "amneziawg-go already installed."; return 0; fi
+  warn "Kernel module unavailable (LXC/OpenVZ?). Installing amneziawg-go..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y -qq golang-go >>"$LOG" 2>&1 || apt-get install -y -qq golang >>"$LOG" 2>&1
+  command -v go >/dev/null 2>&1 || die "Go toolchain not available."
+  rm -rf /tmp/awg-go
+  git clone -q --depth 1 https://github.com/amnezia-vpn/amneziawg-go /tmp/awg-go >>"$LOG" 2>&1 \
+    || die "Cannot fetch amneziawg-go."
+  ( cd /tmp/awg-go && go build -o /usr/local/bin/amneziawg-go . ) >>"$LOG" 2>&1 \
+    || die "Build of amneziawg-go failed. See ${LOG}."
+  chmod +x /usr/local/bin/amneziawg-go
+  [[ -e /dev/net/tun ]] || { mkdir -p /dev/net; mknod /dev/net/tun c 10 200 2>/dev/null; chmod 600 /dev/net/tun; }
+  ok "amneziawg-go installed."
+}
+
+setup_backend() {
+  if kernel_ok; then
+    ok "Kernel module 'amneziawg' works."
+    echo "amneziawg" > /etc/modules-load.d/amneziawg.conf
+    USERSPACE=0
+  else
+    install_userspace
+    USERSPACE=1
+  fi
+  mkdir -p /etc/default
+  if [[ $USERSPACE -eq 1 ]]; then
+    cat > /etc/default/amneziawg <<'EOF'
+WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
+AWG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
+WG_SUDO=1
 EOF
-  sysctl --system >/dev/null 2>&1 || true
+  else
+    : > /etc/default/amneziawg
+  fi
+  show_versions
 }
 
-generate_cert() {
-  mkdir -p "$CFG_DIR"
-  chmod 700 "$CFG_DIR"
+# ---------- obfuscation profiles ----------
+# AmneziaWG 2.0: S1-S4 padding, H1-H4 as ranges, optional I1 mimicry packet
+gen_profile_v2() {
+  PMODE="v2"
+  JC=$(rnd 3 8)
+  JMIN=$(rnd 40 90)
+  JMAX=$(rnd $((JMIN + 60)) 900)
 
-  # Remove old certs
-  rm -f "${CFG_DIR}/server.crt" "${CFG_DIR}/server.key"
+  S1=$(rnd 15 140); S2=$(rnd 15 140)
+  while [[ $((S1 + 56)) -eq $S2 ]]; do S2=$(rnd 15 140); done
+  S3=$(rnd 10 60)
+  S4=$(rnd 4 24)
 
-  info "Generating self-signed SSL certificate..."
-  openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-    -keyout "${CFG_DIR}/server.key" -out "${CFG_DIR}/server.crt" \
-    -days 3650 -subj "/CN=www.bing.com" >/dev/null 2>&1 \
-    || die "Failed to generate certificate."
-
-  chmod 600 "${CFG_DIR}/server.key"
-  chmod 644 "${CFG_DIR}/server.crt"
-
-  SHA256=$(openssl x509 -noout -fingerprint -sha256 -in "${CFG_DIR}/server.crt" \
-    | awk -F '=' '{print $2}' | tr -d ':')
+  # Four NON-overlapping ranges: one per ~1e9 bucket, bucket order shuffled.
+  local order=(0 1 2 3) i j t b lo hi
+  local hs=()
+  for i in 3 2 1; do
+    j=$(rnd 0 "$i"); t=${order[$i]}; order[$i]=${order[$j]}; order[$j]=$t
+  done
+  for i in 0 1 2 3; do
+    b=${order[$i]}
+    lo=$(( b * 1000000000 + $(rnd 100 300000000) ))
+    hi=$(( lo + $(rnd 1000000 600000000) ))
+    hs[$i]="${lo}-${hi}"
+  done
+  H1=${hs[0]}; H2=${hs[1]}; H3=${hs[2]}; H4=${hs[3]}
 }
 
-public_ip() {
-  curl -4fsS --max-time 6 https://api.ipify.org 2>/dev/null || true
+# Legacy 1.x profile: single integer H values, no S3/S4/I1
+gen_profile_legacy() {
+  PMODE="legacy"
+  JC=$(rnd 3 8)
+  JMIN=$(rnd 40 90)
+  JMAX=$(rnd $((JMIN + 60)) 900)
+  S1=$(rnd 15 140); S2=$(rnd 15 140)
+  while [[ $((S1 + 56)) -eq $S2 ]]; do S2=$(rnd 15 140); done
+  S3=""; S4=""; I1=""
+  H1=$(rnd 100000 2147483000); H2=$(rnd 100000 2147483000)
+  H3=$(rnd 100000 2147483000); H4=$(rnd 100000 2147483000)
+  while [[ "$H2" == "$H1" ]]; do H2=$(rnd 100000 2147483000); done
+  while [[ "$H3" == "$H1" || "$H3" == "$H2" ]]; do H3=$(rnd 100000 2147483000); done
+  while [[ "$H4" == "$H1" || "$H4" == "$H2" || "$H4" == "$H3" ]]; do H4=$(rnd 100000 2147483000); done
 }
 
-valid_ipv4() {
-  local ip=$1
-  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  awk -F. '{for(i=1;i<=4;i++) if($i>255) exit 1}' <<< "$ip"
-}
-
-valid_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1024 && "$1" <= 65535 ))
-}
-
-rand_str() {
-  tr -dc 'A-Za-z0-9' < /dev/urandom | head -c "${1:-16}"
-}
-
-rand_between() {
-  local min=$1 max=$2
-  shuf -i "${min}-${max}" -n 1
+# I1 = signature packet sent before the handshake (initiator side)
+gen_i1() {
+  case "$1" in
+    quic) I1="<b 0xc00000000108><r 8><b 0x08><r 8><b 0x00><r $(rnd 600 900)>" ;;
+    dns)  I1="<r 2><b 0x01000001000000000000><b 0x0377777706676f6f676c6503636f6d00><b 0x00010001>" ;;
+    *)    I1="" ;;
+  esac
 }
 
 encode_token() {
-  printf '%s|' "h2v1" "$FOREIGN_IP" "$HY_PORT" "$AUTH_PASS" "$OBFUS_PASS" "$SHA256" \
+  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    "v5" "$FOREIGN_IP" "$AWG_PORT" "$FR_PUB" "$PSK" \
+    "$JC" "$JMIN" "$JMAX" "$S1" "$S2" "${S3:--}" "${S4:--}" \
+    "$H1" "$H2" "$H3" "$H4" "${I1:--}" "$PMODE" \
     | base64 -w0
 }
 
 decode_token() {
-  local raw
-  raw=$(printf '%s' "$1" | tr -d '[:space:]' | base64 -d 2>/dev/null) \
-    || die "Invalid token."
-
-  IFS='|' read -r VERSION FOREIGN_IP HY_PORT AUTH_PASS OBFUS_PASS SHA256 _ <<< "$raw"
-
-  [[ "$VERSION" == "h2v1" ]] || die "This script accepts only h2v1 tokens."
-  valid_ipv4 "$FOREIGN_IP" || die "Invalid foreign IP in token."
-  valid_port "$HY_PORT" || die "Invalid port in token."
-  [[ -n "$AUTH_PASS" && -n "$OBFUS_PASS" && -n "$SHA256" ]] || die "Incomplete token."
+  local raw v
+  raw=$(echo "$1" | tr -d ' \n\r' | base64 -d 2>/dev/null) || die "Invalid token."
+  IFS='|' read -r V FOREIGN_IP AWG_PORT FR_PUB PSK JC JMIN JMAX S1 S2 S3 S4 H1 H2 H3 H4 I1 PMODE <<< "$raw"
+  [[ "$V" == "v5" ]] || die "Token version mismatch (need v5). Re-run option 2 on the foreign server."
+  [[ -n "$FR_PUB" && -n "$AWG_PORT" && -n "$PMODE" ]] || die "Token is incomplete."
+  for v in S3 S4 I1; do
+    if [[ "${!v}" == "-" ]]; then printf -v "$v" ''; fi
+  done
 }
 
-foreign_setup() {
-  cleanup_previous
-  download_binary
-  write_sysctl
-  generate_cert
-
-  local detected
-  detected=$(public_ip)
-  read -rp "Foreign public IPv4 [${detected:-required}]: " FOREIGN_IP
-  FOREIGN_IP="${FOREIGN_IP:-$detected}"
-  valid_ipv4 "$FOREIGN_IP" || die "A valid public IPv4 is required."
-
-  local default_port
-  default_port=$(rand_between 20000 60000)
-  read -rp "Hysteria 2 UDP port [${default_port}]: " HY_PORT
-  HY_PORT="${HY_PORT:-$default_port}"
-  valid_port "$HY_PORT" || die "Invalid UDP port."
-
-  AUTH_PASS=$(rand_str 24)
-  OBFUS_PASS=$(rand_str 24)
-
-  info "Writing server configuration..."
-  cat > "$SERVER_CFG" <<EOF
-listen: :${HY_PORT}
-
-tls:
-  cert: ${CFG_DIR}/server.crt
-  key: ${CFG_DIR}/server.key
-
-obfs:
-  type: salamander
-  salamander:
-    password: "${OBFUS_PASS}"
-
-auth:
-  type: password
-  password: "${AUTH_PASS}"
-
-masquerade:
-  type: proxy
-  proxy:
-    url: https://www.bing.com
-    rewriteHost: true
+# ---------- config writers ----------
+common_iface_block() {
+  cat <<EOF
+[Interface]
+PrivateKey = ${PRIV}
+Address = ${SELF_ADDR}/${CIDR}
+ListenPort = ${LISTEN_PORT}
+MTU = ${MTU}
+Jc = ${JC}
+Jmin = ${JMIN}
+Jmax = ${JMAX}
+S1 = ${S1}
+S2 = ${S2}
 EOF
+  if [[ "$PMODE" == "v2" ]]; then
+    echo "S3 = ${S3}"
+    echo "S4 = ${S4}"
+  fi
+  cat <<EOF
+H1 = ${H1}
+H2 = ${H2}
+H3 = ${H3}
+H4 = ${H4}
+EOF
+  if [[ "$PMODE" == "v2" && -n "${I1:-}" ]]; then
+    echo "I1 = ${I1}"
+  fi
+}
 
-  cat > /etc/systemd/system/hysteria-server.service <<EOF
-[Unit]
-Description=Hysteria 2 Server
-After=network.target
+write_iran_cfg() {
+  local NIC=$1 dnat="" flush="" tail_down=""
+  case "$FWD_MODE" in
+    all)
+      dnat+="PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport ! --dports ${KEEP_TCP} -j DNAT --to-destination ${FR_ADDR}"$'\n'
+      dnat+="PostUp = iptables -t nat -A AWG_DNAT -p udp -m multiport ! --dports ${UDP_EXCL} -j DNAT --to-destination ${FR_ADDR}"$'\n'
+      ;;
+    list)
+      if [[ -n "$FWD_TCP" ]]; then
+        dnat+="PostUp = iptables -t nat -A AWG_DNAT -p tcp -m multiport --dports ${FWD_TCP} -j DNAT --to-destination ${FR_ADDR}"$'\n'
+      fi
+      if [[ -n "$FWD_UDP" ]]; then
+        dnat+="PostUp = iptables -t nat -A AWG_DNAT -p udp -m multiport --dports ${FWD_UDP} -j DNAT --to-destination ${FR_ADDR}"$'\n'
+      fi
+      ;;
+  esac
+  if [[ "$FWD_MODE" != "none" ]]; then
+    flush="PostUp = iptables -t nat -F AWG_DNAT"$'\n'
+    tail_down="PostDown = iptables -t nat -F AWG_DNAT 2>/dev/null || true"$'\n'
+    tail_down+="PostDown = iptables -t nat -X AWG_DNAT 2>/dev/null || true"$'\n'
+  fi
 
+  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
+  {
+    common_iface_block
+    cat <<EOF
+PostUp = sysctl -qw net.ipv4.ip_forward=1
+PostUp = iptables -t nat -N AWG_DNAT 2>/dev/null || true
+EOF
+    printf '%s' "$flush"
+    cat <<EOF
+PostUp = iptables -t nat -C PREROUTING -i ${NIC} -j AWG_DNAT 2>/dev/null || iptables -t nat -I PREROUTING 1 -i ${NIC} -j AWG_DNAT
+EOF
+    printf '%s' "$dnat"
+    cat <<EOF
+PostUp = iptables -t nat -C POSTROUTING -o %i -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o %i -j MASQUERADE
+PostUp = iptables -C FORWARD -i ${NIC} -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i ${NIC} -o %i -j ACCEPT
+PostUp = iptables -C FORWARD -i %i -o ${NIC} -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i %i -o ${NIC} -j ACCEPT
+PostUp = iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -t nat -D PREROUTING -i ${NIC} -j AWG_DNAT 2>/dev/null || true
+EOF
+    printf '%s' "$tail_down"
+    cat <<EOF
+PostDown = iptables -t nat -D POSTROUTING -o %i -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -D FORWARD -i ${NIC} -o %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -i %i -o ${NIC} -j ACCEPT 2>/dev/null || true
+PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+[Peer]
+PublicKey = ${FR_PUB}
+PresharedKey = ${PSK}
+AllowedIPs = ${FR_ADDR}/32
+Endpoint = ${FOREIGN_IP}:${AWG_PORT}
+PersistentKeepalive = 25
+EOF
+  } > "$CFG"
+  chmod 600 "$CFG"
+}
+
+write_foreign_cfg() {
+  local NIC=$1
+  mkdir -p "$CFG_DIR"; chmod 700 "$CFG_DIR"
+  { common_iface_block
+    cat <<EOF
+PostUp = sysctl -qw net.ipv4.ip_forward=1
+PostUp = iptables -C INPUT -p udp --dport ${AWG_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -p udp --dport ${AWG_PORT} -j ACCEPT
+PostUp = iptables -C INPUT -i %i -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i %i -j ACCEPT
+PostUp = iptables -C FORWARD -i %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i %i -j ACCEPT
+PostUp = iptables -C FORWARD -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -o %i -j ACCEPT
+PostUp = iptables -t nat -C POSTROUTING -s ${IR_ADDR}/32 -o ${NIC} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${IR_ADDR}/32 -o ${NIC} -j MASQUERADE
+PostUp = iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -D INPUT -p udp --dport ${AWG_PORT} -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D INPUT -i %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -i %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -D FORWARD -o %i -j ACCEPT 2>/dev/null || true
+PostDown = iptables -t nat -D POSTROUTING -s ${IR_ADDR}/32 -o ${NIC} -j MASQUERADE 2>/dev/null || true
+PostDown = iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+EOF
+    if [[ -n "${IR_PUB:-}" ]]; then
+      cat <<EOF
+
+[Peer]
+PublicKey = ${IR_PUB}
+PresharedKey = ${PSK}
+AllowedIPs = ${IR_ADDR}/32
+PersistentKeepalive = 25
+EOF
+    fi
+  } > "$CFG"
+  chmod 600 "$CFG"
+}
+
+save_foreign_meta() {
+  {
+    echo "ROLE=foreign"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "MTU=${MTU}"
+    echo "PSK=${PSK}"; echo "PMODE=${PMODE}"
+    echo "TOKEN=$(encode_token)"
+  } > "$META"; chmod 600 "$META"
+}
+
+# returns 0 on success, 1 on failure (caller decides what to do)
+bring_up() {
+  set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
+  awg-quick down "$IFACE" >/dev/null 2>&1 || true
+  ip link del "$IFACE" >/dev/null 2>&1 || true
+  if ! awg-quick up "$IFACE"; then
+    return 1
+  fi
+  if [[ -f /usr/lib/systemd/system/awg-quick@.service || -f /lib/systemd/system/awg-quick@.service ]]; then
+    mkdir -p "/etc/systemd/system/awg-quick@${IFACE}.service.d"
+    cat > "/etc/systemd/system/awg-quick@${IFACE}.service.d/override.conf" <<'EOF'
 [Service]
-Type=simple
-ExecStart=${BIN} server -c ${SERVER_CFG}
+EnvironmentFile=-/etc/default/amneziawg
 Restart=on-failure
 RestartSec=5
-LimitNOFILE=51200
-
-[Install]
-WantedBy=multi-user.target
 EOF
-
-  systemctl daemon-reload
-  systemctl enable --now hysteria-server
-
-  sleep 2
-  if systemctl is-active --quiet hysteria-server; then
-    ok "Hysteria 2 server is running."
-  else
-    journalctl -u hysteria-server -n 20 --no-pager
-    die "Server startup failed."
+    systemctl daemon-reload
+    systemctl enable "awg-quick@${IFACE}" >/dev/null 2>&1 && ok "Enabled on boot."
   fi
-
-  echo
-  ok "Foreign side is ready."
-  echo
-  echo "================================================================"
-  echo "CRITICAL: Open UDP/${HY_PORT} in your provider firewall!"
-  echo "================================================================"
-  echo
-  echo "Copy this token to the Iran server:"
-  echo "================================================================"
-  encode_token
-  echo
+  ok "Interface ${IFACE} is up (profile: ${PMODE})."
+  return 0
 }
 
-iran_setup() {
-  cleanup_previous
-  download_binary
-  write_sysctl
-
-  mkdir -p "$CFG_DIR"
-  chmod 700 "$CFG_DIR"
-
-  modprobe tun 2>/dev/null || true
-
-  echo "======================================================================"
-  warn "CRITICAL SECURITY WARNING FOR IRAN SERVER:"
-  warn "Close all incoming ports except SSH to prevent IP blocking."
-  warn "Run: ufw default deny incoming && ufw allow <SSH_PORT>/tcp && ufw enable"
-  echo "======================================================================"
-  echo
-
-  echo "Paste the token from foreign server:"
-  read -r -p "> " TOKEN
-  decode_token "$TOKEN"
-
-  info "Testing UDP connectivity..."
-  if timeout 5 bash -c "echo -n '' > /dev/udp/${FOREIGN_IP}/${HY_PORT}" 2>/dev/null; then
-    ok "UDP port ${HY_PORT} appears reachable."
-  else
-    warn "Cannot verify UDP connectivity. Make sure UDP/${HY_PORT} is open!"
-    read -rp "Continue anyway? (y/N): " CONTINUE
-    [[ "$CONTINUE" =~ ^[Yy]$ ]] || die "Aborted."
-  fi
-
-  info "Writing client configuration..."
-  # Using the simplest TUN config format that works across versions
-  cat > "$CLIENT_CFG" <<EOF
-server: "${FOREIGN_IP}:${HY_PORT}"
-auth: "${AUTH_PASS}"
-
-tls:
-  sni: "www.bing.com"
-  insecure: false
-  pinSHA256: "${SHA256}"
-
-obfs:
-  type: salamander
-  salamander:
-    password: "${OBFUS_PASS}"
-
-transport:
-  type: udp
-
-tun:
-  name: ${IFACE}
-  mtu: 1350
-  address: ${IR_ADDR}
-  strictRoute: false
+sysctl_tuning() {
+  cat > /etc/sysctl.d/99-awg.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv4.conf.all.rp_filter=2
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_mtu_probing=1
 EOF
+  sysctl -q --system >/dev/null 2>&1 || true
+}
 
-  info "Testing config file validity..."
-  if ! "$BIN" client -c "$CLIENT_CFG" --test 2>&1 | grep -qi "error"; then
-    ok "Config file is valid."
-  else
-    warn "Config validation showed warnings, but continuing..."
-    "$BIN" client -c "$CLIENT_CFG" --test 2>&1 || true
-  fi
+wait_handshake() {
+  info "Waiting for handshake (up to 25s)..."
+  for _ in $(seq 1 25); do
+    if awg show "$IFACE" latest-handshakes 2>/dev/null | awk '{if ($2+0 > 0) found=1} END{exit !found}'; then
+      ok "Handshake established."
+      return 0
+    fi
+    sleep 1
+  done
+  warn "No handshake yet. Check provider firewall for UDP port ${AWG_PORT} on the foreign server."
+  return 1
+}
 
-  cat > /etc/systemd/system/hysteria-client.service <<EOF
-[Unit]
-Description=Hysteria 2 Client (TUN)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=${BIN} client -c ${CLIENT_CFG}
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=51200
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_MODULE
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_MODULE
-
-[Install]
-WantedBy=multi-user.target
+# ============================ MENU ============================
+main() {
+  [[ $EUID -eq 0 ]] || die "Run this script as root."
+  banner
+  cat <<EOF
+Select an option:
+  1 - IRAN server      (run this AFTER the foreign server)
+  2 - FOREIGN server   (run this FIRST)
+  3 - FOREIGN: add / update the Iran peer key (live, no restart)
+  4 - Diagnostics
+  5 - Uninstall & clean up
 EOF
+  read -rp "Enter your choice: " CHOICE
 
-  info "Starting service..."
-  systemctl daemon-reload
-  systemctl enable --now hysteria-client
+  case "$CHOICE" in
+  2)
+    install_tools; setup_backend; sysctl_tuning
+    NIC=$(main_iface); [[ -n "$NIC" ]] || die "Cannot detect default network interface."
+    FOREIGN_IP=$(pub_ip)
+    read -rp "Enter FOREIGN server public IP [${FOREIGN_IP:-none}]: " in_ip
+    FOREIGN_IP=${in_ip:-$FOREIGN_IP}
+    [[ -n "$FOREIGN_IP" ]] || die "Foreign IP is required."
 
-  sleep 5
-  
-  if ip link show "$IFACE" >/dev/null 2>&1; then
-    ok "Hysteria 2 tunnel established (${IFACE} is up)."
+    echo "Handshake mimicry (I1):"
+    echo "  1 - QUIC-like  (recommended, default port UDP 443)"
+    echo "  2 - DNS-like   (default port UDP 53)"
+    echo "  3 - none       (random high port)"
+    read -rp "Choice [1]: " MIM; MIM=${MIM:-1}
+    case "$MIM" in
+      2) gen_i1 dns;  DEF_PORT=53 ;;
+      3) gen_i1 none; DEF_PORT=$(rnd 20000 60000) ;;
+      *) gen_i1 quic; DEF_PORT=443 ;;
+    esac
+    if udp_port_busy "$DEF_PORT"; then
+      warn "UDP ${DEF_PORT} is already in use on this server; picking a random port instead."
+      DEF_PORT=$(rnd 20000 60000)
+    fi
+    read -rp "AmneziaWG UDP port [${DEF_PORT}]: " AWG_PORT
+    AWG_PORT=${AWG_PORT:-$DEF_PORT}
+    udp_port_busy "$AWG_PORT" && warn "UDP ${AWG_PORT} looks busy - the tunnel may fail to start."
+    read -rp "Tunnel MTU [1320]: " MTU; MTU=${MTU:-1320}
+
+    if [[ "${FORCE_LEGACY:-0}" == "1" ]]; then gen_profile_legacy; else
+      I1_SAVE="$I1"; gen_profile_v2; I1="$I1_SAVE"
+    fi
+    PRIV=$(awg genkey); FR_PUB=$(echo "$PRIV" | awg pubkey); PSK=$(awg genpsk)
+    SELF_ADDR="$FR_ADDR"; IR_PUB=""; LISTEN_PORT="$AWG_PORT"
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+      ufw allow "${AWG_PORT}/udp" >/dev/null 2>&1 && ok "ufw: allowed ${AWG_PORT}/udp"
+    fi
+
+    write_foreign_cfg "$NIC"; save_foreign_meta
+    if ! bring_up; then
+      if [[ "$PMODE" == "v2" ]]; then
+        warn "The installed AmneziaWG rejected the 2.0 profile. Falling back to the legacy (1.x) profile."
+        warn "Obfuscation will be weaker. Update amneziawg on this server and re-run to get 2.0."
+        gen_profile_legacy
+        write_foreign_cfg "$NIC"; save_foreign_meta
+        bring_up || die "awg-quick failed even with the legacy profile. See the error above."
+      else
+        die "awg-quick failed to start ${IFACE}."
+      fi
+    fi
+
     echo
-    echo "=== Connection Info ==="
-    ip -4 addr show "$IFACE"
+    ok "Foreign server configured (profile: ${PMODE})."
+    echo "${YELLOW}${BOLD}Copy this ONE token and paste it on the Iran server (option 1):${RESET}"
+    echo "${CYAN}$(encode_token)${RESET}"
     echo
-  else
-    warn "Interface ${IFACE} not found. Checking logs..."
-    journalctl -u hysteria-client -n 30 --no-pager
+    ;;
+
+  1)
+    install_tools; setup_backend; sysctl_tuning
+    NIC=$(main_iface); [[ -n "$NIC" ]] || die "Cannot detect default network interface."
+    echo "Paste the token printed by the FOREIGN server:"
+    read -rp "> " TOKEN
+    decode_token "$TOKEN"
+    read -rp "Tunnel MTU [1320]: " MTU; MTU=${MTU:-1320}
+
+    echo "Which traffic arriving on this Iran server goes through the tunnel?"
+    echo "  1 - ALL ports except a keep-list (classic behaviour)"
+    echo "  2 - ONLY the ports I list"
+    echo "  3 - Nothing yet (chain AWG_DNAT stays empty; add rules yourself / from your bot)"
+    read -rp "Choice [2]: " FM; FM=${FM:-2}
+    FWD_TCP=""; FWD_UDP=""; KEEP_TCP=""; UDP_EXCL=""
+    LISTEN_PORT=$(rnd 30000 60000)
+    while [[ "$LISTEN_PORT" == "$AWG_PORT" ]] || udp_port_busy "$LISTEN_PORT"; do LISTEN_PORT=$(rnd 30000 60000); done
+    case "$FM" in
+      1)
+        FWD_MODE="all"
+        read -rp "TCP ports to KEEP on this server [${DEF_KEEP_TCP}]: " kp
+        KEEP_TCP=$(merge_ports "${kp:-$DEF_KEEP_TCP}" "$(ssh_ports)")
+        read -rp "UDP ports to KEEP on this server [none]: " ku
+        UDP_EXCL=$(merge_ports "$LISTEN_PORT" "${ku:-}")
+        info "Kept TCP: ${KEEP_TCP} | Kept UDP: ${UDP_EXCL}"
+        ;;
+      3)
+        FWD_MODE="none"
+        ;;
+      *)
+        FWD_MODE="list"
+        echo "Ports format: 2000,2001,3000:3100  (iptables multiport: max 15 entries, a range counts as 2)"
+        read -rp "TCP ports to forward to the foreign server [none]: " FWD_TCP
+        read -rp "UDP ports to forward to the foreign server [none]: " FWD_UDP
+        FWD_UDP=$(printf '%s' "$FWD_UDP" | tr ',' '\n' | grep -vx "$LISTEN_PORT" | paste -sd, -)
+        ;;
+    esac
+
+    PRIV=$(awg genkey); IR_PUB=$(echo "$PRIV" | awg pubkey)
+    SELF_ADDR="$IR_ADDR"
+    write_iran_cfg "$NIC"
+    {
+      echo "ROLE=iran"; echo "NIC=${NIC}"; echo "PORT=${AWG_PORT}"; echo "LISTEN=${LISTEN_PORT}"
+      echo "MTU=${MTU}"; echo "FWD_MODE=${FWD_MODE}"; echo "PMODE=${PMODE}"
+    } > "$META"
+    chmod 600 "$META"
+    bring_up || die "awg-quick failed. If the error mentions an unknown key (H1 range / I1 / S3 / S4) this server's AmneziaWG is too old for the 2.0 profile: update it, or re-run the foreign server with FORCE_LEGACY=1 to get a legacy token."
+
     echo
-    echo "=== Current Config File ==="
-    cat "$CLIENT_CFG"
-    die "Tunnel interface did not come up."
-  fi
+    ok "Iran server configured (profile: ${PMODE}, listen UDP ${LISTEN_PORT})."
+    echo "${YELLOW}${BOLD}Iran public key -> paste it on the FOREIGN server (option 3):${RESET}"
+    echo "${CYAN}${IR_PUB}${RESET}"
+    echo
+    wait_handshake || true
+    ;;
+
+  3)
+    [[ -f "$CFG" ]] || die "No config at ${CFG}. Run option 2 first."
+    read -rp "Enter IRAN server public key: " IR_PUB
+    [[ -n "$IR_PUB" ]] || die "Key is required."
+    PSK_LINE=$(sed -n 's/^PSK=//p' "$META" 2>/dev/null | head -n1)
+    [[ -n "$PSK_LINE" ]] || PSK_LINE=$(awk '/^PresharedKey/{print $3; exit}' "$CFG")
+    [[ -n "$PSK_LINE" ]] || die "Could not recover PresharedKey."
+    OLD_PUB=$(awk '/^\[Peer\]/{p=1} p&&/^PublicKey/{print $3; exit}' "$CFG")
+
+    # persist to the config file first
+    awk '/^\[Peer\]/{exit} {print}' "$CFG" > "${CFG}.new"
+    cat >> "${CFG}.new" <<EOF
+
+[Peer]
+PublicKey = ${IR_PUB}
+PresharedKey = ${PSK_LINE}
+AllowedIPs = ${IR_ADDR}/32
+PersistentKeepalive = 25
+EOF
+    mv "${CFG}.new" "$CFG"; chmod 600 "$CFG"
+
+    set -a; . /etc/default/amneziawg 2>/dev/null || true; set +a
+    if awg show "$IFACE" >/dev/null 2>&1; then
+      # live update: other peers/users are not interrupted
+      if [[ -n "$OLD_PUB" && "$OLD_PUB" != "$IR_PUB" ]]; then
+        awg set "$IFACE" peer "$OLD_PUB" remove 2>/dev/null || true
+      fi
+      awg set "$IFACE" peer "$IR_PUB" preshared-key <(printf '%s' "$PSK_LINE") \
+          allowed-ips "${IR_ADDR}/32" persistent-keepalive 25 \
+        || die "awg set failed."
+      ok "Iran peer added live (no restart)."
+    else
+      PMODE=$(sed -n 's/^PMODE=//p' "$META" | head -n1); PMODE=${PMODE:-v2}
+      bring_up || die "Start failed."
+      ok "Interface was down; started with the new peer."
+    fi
+    ;;
+
+  4)
+    show_versions
+    echo
+    awg show "$IFACE" 2>/dev/null || echo "No device active."
+    echo
+    if [[ -f "$META" ]]; then
+      ROLE_NOW=$(sed -n 's/^ROLE=//p' "$META" | head -n1)
+      info "Role: ${ROLE_NOW} | profile: $(sed -n 's/^PMODE=//p' "$META" | head -n1)"
+      if [[ "$ROLE_NOW" == "iran" ]]; then
+        iptables -t nat -S AWG_DNAT 2>/dev/null || true
+      else
+        info "Token (for the Iran server):"
+        sed -n 's/^TOKEN=//p' "$META"
+      fi
+    fi
+    ;;
+
+  5)
+    systemctl disable --now "awg-quick@${IFACE}" >/dev/null 2>&1 || true
+    awg-quick down "$IFACE" >/dev/null 2>&1 || true
+    rm -rf "$CFG_DIR" "/etc/systemd/system/awg-quick@${IFACE}.service.d" \
+           /etc/sysctl.d/99-awg.conf /etc/modules-load.d/amneziawg.conf
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    ok "Cleaned up."
+    ;;
+  *)
+    die "Invalid choice."
+    ;;
+  esac
 }
 
-diagnostics() {
-  echo "=== Script Version: ${SCRIPT_VERSION} ==="
-  echo
-  echo "=== Hysteria Binary ==="
-  "$BIN" version 2>&1 || echo "Not installed"
-  echo
-  echo "=== Service Status ==="
-  systemctl status hysteria-client --no-pager -n 15 2>/dev/null \
-    || systemctl status hysteria-server --no-pager -n 15 2>/dev/null \
-    || echo "No service found."
-  echo
-  echo "=== Interface ==="
-  ip -4 addr show "$IFACE" 2>/dev/null || echo "Interface ${IFACE} not found."
-  echo
-  echo "=== Config File ==="
-  if [[ -f "$CLIENT_CFG" ]]; then
-    cat "$CLIENT_CFG"
-  elif [[ -f "$SERVER_CFG" ]]; then
-    cat "$SERVER_CFG"
-  else
-    echo "No config found."
-  fi
-}
-
-uninstall_all() {
-  cleanup_previous
-  rm -rf "$CFG_DIR"
-  rm -f "$BIN"
-  rm -f /etc/sysctl.d/99-hysteria-tunnel.conf
-  sysctl --system >/dev/null 2>&1 || true
-  ok "Hysteria 2 completely removed."
-}
-
-echo
-echo "=========================================================="
-echo " Hysteria 2 Stealth Tunnel v${SCRIPT_VERSION}"
-echo "=========================================================="
-echo "1) Configure Iran server      (run AFTER foreign)"
-echo "2) Configure foreign server   (run FIRST)"
-echo "3) Diagnostics"
-echo "4) Uninstall tunnel"
-echo
-
-read -r -p "Choice: " CHOICE
-
-case "$CHOICE" in
-  1) iran_setup ;;
-  2) foreign_setup ;;
-  3) diagnostics ;;
-  4) uninstall_all ;;
-  *) die "Invalid choice." ;;
-esac
+# allow sourcing for tests; run the menu only when executed directly
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
